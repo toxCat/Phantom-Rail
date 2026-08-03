@@ -4,15 +4,17 @@
 #include <stdint.h>
 
 /*
- * Register-level (CMSIS, no HAL) bit-bang I2C driver for a 16x2 HD44780
+ * Register-level (CMSIS, no HAL) hardware-I2C2 driver for a 16x2 HD44780
  * LCD behind a PCF8574 "I2C backpack", for the STM32F411 "black pill".
  *
- * Pins (bit-banged, open-drain, relying on the backpack's onboard pull-ups):
- *     PB8 = SCL
- *     PB9 = SDA
+ * Pins (hardware I2C2, open-drain, relying on the backpack's onboard pull-ups):
+ *     PB10 = SCL  (AF4)
+ *     PB3  = SDA  (AF9)
  *
- * This deliberately does NOT use a hardware I2C peripheral, so that the
- * chip's I2C1 (PB6/PB7) stays free for the inter-black-pill slave link.
+ * The LCD runs on the F411's hardware I2C2 peripheral so that I2C1 (PB6/PB7)
+ * stays free for the inter-black-pill slave link. On the F411 both PB6/PB7 and
+ * PB8/PB9 are I2C1 mappings, so the LCD cannot share I2C1 with the link --
+ * hence hardware I2C2 on PB10/PB3.
  */
 
 /* 7-bit address of the PCF8574 backpack.

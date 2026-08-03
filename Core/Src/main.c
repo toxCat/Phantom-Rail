@@ -70,9 +70,10 @@ void SystemClock_Config(void);
  *   3. row0: "IN:nS XX.XXV"     (n = detected cell count)
  *      row1: "OUT:XX.XXV"
  *
- * The LCD itself is driven by the register-level (CMSIS, no HAL) bit-bang
- * driver in Src/lcd1602.c. It owns its own GPIO pins, so the generated HAL
- * I2C init is deliberately left uncalled (see MX_I2C*_Init note below).
+ * The LCD itself is driven by the register-level (CMSIS, no HAL) hardware-I2C2
+ * driver in Src/lcd1602.c. It owns the I2C2 peripheral (PB10/PB3), so the
+ * generated HAL I2C init is deliberately left uncalled (see MX_I2C*_Init note
+ * below).
  */
 
 /* Format millivolts as exactly "XX.XX" (5 chars + NUL). */
@@ -159,10 +160,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  /* MX_I2C1_Init() / MX_I2C2_Init() intentionally NOT called: the LCD uses the
-   * register-level bit-bang driver (Src/lcd1602.c), which drives its own GPIO
-   * pins, and the I2C1 inter-board slave link is not implemented yet. The
-   * generated HAL I2C init remains available in i2c.c for when it is. */
+  /* MX_I2C1_Init() / MX_I2C2_Init() intentionally NOT called: the LCD driver
+   * (Src/lcd1602.c) owns and configures I2C2 (PB10/PB3) at register level, and
+   * the I2C1 inter-board slave link is not implemented yet. The generated HAL
+   * I2C init remains available in i2c.c for when it is. */
   /* USER CODE BEGIN 2 */
   lcd_init();
 
