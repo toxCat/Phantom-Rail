@@ -152,4 +152,4 @@ void lcd_init(void)
     lcd_cmd(0x01); delay_ms(2); /* clear */
     lcd_cmd(0x06);              /* entry mode: increment, no shift */
     lcd_cmd(0x0C);              /* display on, cursor off, blink off */
-}i
+}
