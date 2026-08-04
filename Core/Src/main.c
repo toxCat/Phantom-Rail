@@ -129,6 +129,34 @@ static void draw_out(uint32_t mv)
     lcd_print(line);
 }
 
+/* -------- On-board LED heartbeat (PC13, active low) --------
+ * Headless bring-up aid: gives a boot/status signal that does NOT depend on
+ * the I2C bus or the LCD, so we can tell "MCU not running" apart from "MCU
+ * running but I2C silent". */
+static void led_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    GPIOC->MODER &= ~(3u << (13 * 2));
+    GPIOC->MODER |=  (1u << (13 * 2));   /* general-purpose output */
+    GPIOC->ODR   |=  (1u << 13);         /* LED off (cathode on PC13) */
+}
+static inline void led_toggle(void) { GPIOC->ODR ^= (1u << 13); }
+
+/* DWT (the driver's us timer) isn't running until lcd_init(), so the boot
+ * blink uses a crude cycle loop -- timing is approximate, only needs to be
+ * visible to a human eye (~150 ms per half at 16 MHz HSI). */
+static void crude_delay(uint32_t loops)
+{
+    for (volatile uint32_t i = 0; i < loops; i++) { __NOP(); }
+}
+static void led_flash(uint8_t n)
+{
+    while (n--) {
+        GPIOC->ODR &= ~(1u << 13); crude_delay(600000U);   /* on  */
+        GPIOC->ODR |=  (1u << 13); crude_delay(600000U);   /* off */
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -165,13 +193,20 @@ int main(void)
    * the I2C1 inter-board slave link is not implemented yet. The generated HAL
    * I2C init remains available in i2c.c for when it is. */
   /* USER CODE BEGIN 2 */
-  lcd_init();
+  led_init();
+  led_flash(3);            /* 3 flashes at boot => we ARE running from flash */
 
-  /* 1-2: splash, then clear */
-  lcd_set_cursor(0, 0);
-  lcd_print("LM51772 Sim");
-  lcd_delay_ms(1500);
-  lcd_clear();
+  /* Bring up I2C2 + the panel; auto-detects the PCF8574 address (0x27/0x3F).
+   * Returns the address that ACKed, or 0 if the bus is silent. */
+  uint8_t lcd_addr = lcd_init();
+
+  if (lcd_addr) {
+    /* 1-2: splash, then clear */
+    lcd_set_cursor(0, 0);
+    lcd_print("LM51772 Sim");
+    lcd_delay_ms(1500);
+    lcd_clear();
+  }
 
   uint32_t t = 0;
   /* USER CODE END 2 */
@@ -183,16 +218,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* ---- STUB DATA: replace with I2C value from first black pill ---- */
-    uint32_t in_mv  = 7400U + (t % 1000U);   /* fake ramp 7.40 -> 8.40 V */
-    uint32_t out_mv = 12000U;                /* fake setpoint 12.00 V   */
-    /* ---------------------------------------------------------------- */
+    if (lcd_addr) {
+      /* ---- STUB DATA: replace with I2C value from first black pill ---- */
+      uint32_t in_mv  = 7400U + (t % 1000U);   /* fake ramp 7.40 -> 8.40 V */
+      uint32_t out_mv = 12000U;                /* fake setpoint 12.00 V   */
+      /* -------------------------------------------------------------- */
 
-    uint8_t s = cell_count(in_mv);
-    draw_in(s, in_mv);
-    draw_out(out_mv);
+      uint8_t s = cell_count(in_mv);
+      draw_in(s, in_mv);
+      draw_out(out_mv);
 
-    lcd_delay_ms(250);
+      led_toggle();          /* ~1 Hz heartbeat = running + LCD ACKing  */
+      lcd_delay_ms(250);
+    } else {
+      led_toggle();          /* ~5 Hz blink = running but I2C is silent */
+      lcd_delay_ms(100);
+    }
     t += 100U;
   }
   /* USER CODE END 3 */

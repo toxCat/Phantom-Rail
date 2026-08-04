@@ -20,6 +20,10 @@
  * (blank screen) instead of hanging the MCU. */
 #define I2C_TIMEOUT_US 10000U
 
+/* Active 7-bit backpack address. Starts at the compile-time default but
+ * lcd_init() overwrites it with whatever actually ACKs on the bus. */
+static uint8_t s_addr = LCD_ADDR;
+
 /* -------- microsecond delay via the DWT cycle counter -------- */
 static void dwt_init(void)
 {
@@ -115,7 +119,7 @@ static uint8_t pcf_write(uint8_t data)
 
     /* Address + write. SB is cleared by the SR1 read above followed by the
      * DR write here. */
-    I2C2->DR = (uint8_t)(LCD_ADDR << 1);
+    I2C2->DR = (uint8_t)(s_addr << 1);
     if (!i2c_wait_sr1(I2C_SR1_ADDR)) {           /* EV6, or AF on wrong addr */
         I2C2->SR1 &= ~I2C_SR1_AF;                /* clear the NACK flag      */
         I2C2->CR1 |= I2C_CR1_STOP;
@@ -131,6 +135,29 @@ static uint8_t pcf_write(uint8_t data)
     /* STOP */
     I2C2->CR1 |= I2C_CR1_STOP;
     return 1;
+}
+
+/* Address-only probe: START, addr+W, look for ACK, STOP. Returns 1 if a
+ * slave acknowledges its 7-bit address, 0 on NACK / timeout. Used to sniff
+ * out which PCF8574 variant is on the bus without writing anything to it. */
+static uint8_t i2c_probe(uint8_t addr7)
+{
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = I2C_TIMEOUT_US * (SystemCoreClock / 1000000U);
+    while (I2C2->SR2 & I2C_SR2_BUSY) {
+        if ((DWT->CYCCNT - start) > ticks) return 0;
+    }
+
+    I2C2->CR1 |= I2C_CR1_START;
+    if (!i2c_wait_sr1(I2C_SR1_SB)) { I2C2->CR1 |= I2C_CR1_STOP; return 0; }
+
+    I2C2->DR = (uint8_t)(addr7 << 1);
+    uint8_t ack = i2c_wait_sr1(I2C_SR1_ADDR);
+    if (ack) { (void)I2C2->SR1; (void)I2C2->SR2; }  /* clear ADDR */
+    else     { I2C2->SR1 &= ~I2C_SR1_AF; }          /* clear NACK */
+
+    I2C2->CR1 |= I2C_CR1_STOP;
+    return ack;
 }
 
 /* -------- HD44780 in 4-bit mode via the PCF8574 -------- */
@@ -163,10 +190,20 @@ void lcd_set_cursor(uint8_t col, uint8_t row)
     lcd_cmd((uint8_t)(0x80 | (base[row & 1] + col)));
 }
 
-void lcd_init(void)
+uint8_t lcd_init(void)
 {
     dwt_init();
     i2c2_init();
+
+    /* Auto-detect the backpack address: try the compile-time default first,
+     * then the two standard PCF8574 / PCF8574A addresses. Whichever ACKs
+     * becomes the active address; return 0 if the bus stays silent. */
+    static const uint8_t cand[] = { LCD_ADDR, 0x27, 0x3F };
+    uint8_t found = 0;
+    for (unsigned i = 0; i < sizeof(cand); i++) {
+        if (i2c_probe(cand[i])) { s_addr = cand[i]; found = cand[i]; break; }
+    }
+    if (!found) return 0;   /* nobody home -- skip the (futile) panel init */
 
     delay_ms(50);   /* HD44780 power-on settling */
 
@@ -181,4 +218,6 @@ void lcd_init(void)
     lcd_cmd(0x01); delay_ms(2); /* clear */
     lcd_cmd(0x06);              /* entry mode: increment, no shift */
     lcd_cmd(0x0C);              /* display on, cursor off, blink off */
+
+    return found;
 }

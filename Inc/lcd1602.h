@@ -23,7 +23,11 @@
 #define LCD_ADDR 0x27
 #endif
 
-void lcd_init(void);
+/* Initialise the panel. Brings up I2C2, then auto-detects the PCF8574
+ * address (compile-time LCD_ADDR, else 0x27, else 0x3F). Returns the 7-bit
+ * address that ACKed, or 0 if the bus is silent (no backpack / bad wiring /
+ * no pull-ups) -- in which case the panel is left untouched. */
+uint8_t lcd_init(void);
 void lcd_clear(void);
 void lcd_set_cursor(uint8_t col, uint8_t row);   /* row 0..1, col 0..15 */
 void lcd_print(const char *s);
