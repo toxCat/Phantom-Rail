@@ -24,6 +24,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lcd1602.h"
+#include "i2c1_slave.h"    /* inter-board I2C1 link (PB6/PB7) */
+#include "phantom_link.h"  /* shared wire format (../Protocol) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,15 +61,17 @@ void SystemClock_Config(void);
 /*
  * LM51772 Sim -- LCD bring-up demo (second black pill).
  *
- * Purpose: prove the PCF8574 + 1602 render path before any FC / I2C-link
- * traffic exists. IN and OUT values are STUBBED here; the real IN voltage
- * will arrive over I2C from the first black pill (translator), and OUT is
- * the simulated LM51772 setpoint.
+ * Purpose: render the source telemetry that the translator (first black pill)
+ * pushes over the I2C1 link, and stand in for the LM51772 output. The IN row
+ * now shows the REAL source: the translator reads the pack behind its /9
+ * divider, detects the cell count, and writes a frame to us (I2C1 slave,
+ * address PR_I2C_ADDR). OUT is still a stubbed LM51772 setpoint.
  *
  * Screen flow:
  *   1. splash "LM51772 Sim"
  *   2. clear
- *   3. row0: "IN:nS XX.XXV"     (n = detected cell count)
+ *   3. row0: "IN:nS XX.XXV"     (n = cell count from the translator;
+ *                                "--" until a valid frame arrives)
  *      row1: "OUT:XX.XXV"
  *
  * The LCD itself is driven by the register-level (CMSIS, no HAL) hardware-I2C2
@@ -90,14 +94,8 @@ static void fmt_volts(char *buf, uint32_t mv)
     buf[5] = '\0';
 }
 
-/* Naive cell count: smallest S in 1..8 with mv/S <= 4.20 V/cell.
- * Real detection belongs on the first black pill (it owns the ADC). */
-static uint8_t cell_count(uint32_t mv)
-{
-    for (uint8_t s = 1; s <= 8; s++)
-        if (mv <= (uint32_t)s * 4200U) return s;
-    return 8;
-}
+/* Cell detection now lives on the translator (it owns the ADC); the sim just
+ * displays the cell count it receives over I2C1. */
 
 /* Build a padded 16-char row (+NUL) and push it at the given line. */
 static void draw_in(uint8_t s, uint32_t mv)
@@ -113,6 +111,14 @@ static void draw_in(uint8_t s, uint32_t mv)
     line[16] = '\0';
     lcd_set_cursor(0, 0);
     lcd_print(line);
+}
+
+/* Row0 when there's no live source yet (link idle / translator quiet):
+ * keep the familiar layout but blank the numbers -> "IN:--S --.--V". */
+static void draw_in_stale(void)
+{
+    lcd_set_cursor(0, 0);
+    lcd_print("IN:--S --.--V   ");
 }
 
 static void draw_out(uint32_t mv)
@@ -200,6 +206,10 @@ int main(void)
    * Returns the address that ACKed, or 0 if the bus is silent. */
   uint8_t lcd_addr = lcd_init();
 
+  /* Bring up the I2C1 slave link regardless of the LCD: the translator can
+   * start pushing frames the moment we ACK our address. */
+  i2c1_slave_init(PR_I2C_ADDR);
+
   if (lcd_addr) {
     /* 1-2: splash, then clear */
     lcd_set_cursor(0, 0);
@@ -207,8 +217,6 @@ int main(void)
     lcd_delay_ms(1500);
     lcd_clear();
   }
-
-  uint32_t t = 0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -218,23 +226,24 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* Latest source telemetry from the translator over I2C1. Treat it as live
+     * only if it's flagged valid AND recent (guards against a pulled link). */
+    uint16_t in_mv;
+    uint8_t  cells, flags;
+    i2c1_slave_get(&in_mv, &cells, &flags);
+    int have_src = (flags & PR_FLAG_VALID) && (i2c1_slave_age_ms() < 1500U);
+
     if (lcd_addr) {
-      /* ---- STUB DATA: replace with I2C value from first black pill ---- */
-      uint32_t in_mv  = 7400U + (t % 1000U);   /* fake ramp 7.40 -> 8.40 V */
-      uint32_t out_mv = 12000U;                /* fake setpoint 12.00 V   */
-      /* -------------------------------------------------------------- */
-
-      uint8_t s = cell_count(in_mv);
-      draw_in(s, in_mv);
-      draw_out(out_mv);
-
-      led_toggle();          /* ~1 Hz heartbeat = running + LCD ACKing  */
-      lcd_delay_ms(250);
-    } else {
-      led_toggle();          /* ~5 Hz blink = running but I2C is silent */
-      lcd_delay_ms(100);
+      if (have_src) draw_in(cells, in_mv);
+      else          draw_in_stale();
+      draw_out(12000U);        /* OUT: stubbed LM51772 setpoint (12.00 V) */
     }
-    t += 100U;
+
+    /* Heartbeat encodes link state without needing the LCD:
+     *   ~2 Hz  = live source frames arriving
+     *   ~5 Hz  = running but no valid source / link idle */
+    led_toggle();
+    lcd_delay_ms(have_src ? 250U : 100U);
   }
   /* USER CODE END 3 */
 }

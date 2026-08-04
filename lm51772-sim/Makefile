@@ -59,7 +59,8 @@ Core/Src/stm32f4xx_hal_msp.c \
 Core/Src/system_stm32f4xx.c \
 Core/Src/sysmem.c \
 Core/Src/syscalls.c \
-Src/lcd1602.c
+Src/lcd1602.c \
+Src/i2c1_slave.c
 
 # ASM sources
 ASM_SOURCES =  \
@@ -122,6 +123,7 @@ AS_INCLUDES =
 C_INCLUDES =  \
 -ICore/Inc \
 -IInc \
+-I../Protocol \
 -I../Drivers/STM32F4xx_HAL_Driver/Inc \
 -I../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy \
 -I../Drivers/CMSIS/Device/ST/STM32F4xx/Include \

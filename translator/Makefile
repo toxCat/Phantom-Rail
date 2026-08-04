@@ -30,6 +30,7 @@ BUILD_DIR = build
 # C sources
 C_SOURCES =  \
 Core/Src/main.c \
+Core/Src/i2c1_master.c \
 Core/Src/system_stm32f4xx.c \
 Core/Src/sysmem.c \
 Core/Src/syscalls.c
@@ -94,6 +95,7 @@ AS_INCLUDES =
 C_INCLUDES =  \
 -ICore/Inc \
 -IInc \
+-I../Protocol \
 -I../Drivers/CMSIS/Device/ST/STM32F4xx/Include \
 -I../Drivers/CMSIS/Include
 
