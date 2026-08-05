@@ -40,14 +40,17 @@
 #define CELL_MAX_MV 4300U  /* per-cell ceiling used for the S estimate   */
 #define SRC_MIN_MV  5000U  /* below this: nothing meaningful is connected */
 
-/* ---- Power FET (Task 1) ----
- * N-channel Power FET gate on PA1, active-high: drive high to enable the power
- * path once a battery is detected AND its per-cell voltage sits within the
- * healthy window [CELL_LO_MV, CELL_HI_MV]. (Task 2 subdivides this window with
- * an intermediate "LOW" warning tier and the flat-pack cutoff.) */
-#define PWRFET_PIN  1U     /* PA1 */
-#define CELL_LO_MV  3200U  /* min healthy cell voltage (below -> FET off) */
-#define CELL_HI_MV  4200U  /* max healthy cell voltage (above -> FET off) */
+/* ---- Power FET + sag monitor (Task 1 + 2) ----
+ * N-channel Power FET gate on PA1, active-high. Per-cell voltage (against the
+ * latched cell count) sorts the pack into three bands:
+ *   >= 3.6 V .. 4.2 V : charged   -> FET on
+ *   3.2 V .. < 3.6 V  : sag/LOW    -> FET on, "LOW" warning on the sim
+ *   < 3.2 V           : critical   -> FET off, "(x_X)" on the sim
+ * (>4.2 V is treated as over-voltage / bad reading -> FET off.) */
+#define PWRFET_PIN   1U    /* PA1 */
+#define CELL_CRIT_MV 3200U /* below: critical, cut the FET, show "(x_X)"     */
+#define CELL_LOW_MV  3600U /* 3.2-3.6: sag warning, FET stays on            */
+#define CELL_HI_MV   4200U /* 3.6-4.2: charged; above: over-voltage guard   */
 
 /* Latest values, exposed (volatile, non-static) so they survive -Og and can
  * be watched over SWD. */
@@ -151,23 +154,39 @@ int main(void)
         uint32_t src_mv = mv_pin * VDIV_NUM / VDIV_DEN;
         g_source_mv     = src_mv;
 
-        /* 2. Detect the pack. */
-        uint8_t cells = 0;
+        /* 2. Detect the pack, latching the cell count at plug-in. Re-detecting
+         *    every loop would mis-count a sagging pack as fewer cells and mask
+         *    the sag; g_cells holds the count until the pack is removed. */
         uint8_t flags = 0;
         if (src_mv >= SRC_MIN_MV) {
-            cells  = (uint8_t)(src_mv / CELL_MAX_MV) + 1U;
+            if (g_cells == 0) g_cells = (uint8_t)(src_mv / CELL_MAX_MV) + 1U;
             flags |= PR_FLAG_VALID;
+        } else {
+            g_cells = 0;                  /* disconnected -> re-detect next pack */
         }
-        g_cells = cells;
+        uint8_t cells = g_cells;
 
-        /* 3. Power FET (Task 1): enable the power path only when a battery is
-         *    detected and its per-cell voltage is within the healthy window. */
+        /* 3. Sag monitor + Power FET (Task 2). Per-cell voltage against the
+         *    latched count sorts into charged / low / critical; the FET stays
+         *    on through the LOW band and only cuts below the critical floor. */
         uint16_t per_cell = (cells > 0) ? (uint16_t)(src_mv / cells) : 0U;
         g_cell_mv = per_cell;
-        uint8_t fet_on = (flags & PR_FLAG_VALID) && (cells > 0) &&
-                         (per_cell >= CELL_LO_MV) && (per_cell <= CELL_HI_MV);
+
+        uint8_t fet_on = 0;
+        if (flags & PR_FLAG_VALID) {
+            if (per_cell < CELL_CRIT_MV) {
+                flags |= PR_FLAG_CRIT;    /* < 3.2 V: critical -> FET off */
+            } else if (per_cell < CELL_LOW_MV) {
+                flags |= PR_FLAG_LOW;     /* 3.2-3.6 V: sag warning       */
+                fet_on = 1;
+            } else if (per_cell <= CELL_HI_MV) {
+                fet_on = 1;               /* 3.6-4.2 V: charged           */
+            }
+            /* > 4.2 V (over-voltage / bad reading): leave FET off, no warning */
+        }
         pwrfet_set(fet_on);
         g_fet_on = fet_on;
+        if (fet_on) flags |= PR_FLAG_FET_ON;
 
         /* 4. Push the telemetry frame to the sim over I2C1. u16 caps at
          *    65.535 V, far above any pack we sense. */

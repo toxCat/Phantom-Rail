@@ -15,8 +15,8 @@
  *   [0] CMD    = PR_CMD_TELEMETRY
  *   [1] VIN_L  source millivolts, low byte   (u16 little-endian)
  *   [2] VIN_H  source millivolts, high byte
- *   [3] CELLS  detected LiPo cell count (S), 0 = unknown
- *   [4] FLAGS  bit0 = PR_FLAG_VALID (a real source is present)
+ *   [3] CELLS  detected LiPo cell count (S), latched at plug-in, 0 = unknown
+ *   [4] FLAGS  bitfield: VALID | LOW | CRIT | FET_ON (see below)
  *   [5] XOR    XOR of bytes [0..4] (link integrity check)
  */
 #include <stdint.h>
@@ -26,7 +26,12 @@
 
 #define PR_CMD_TELEMETRY  0x10u    /* frame[0] for a telemetry update        */
 #define PR_FRAME_LEN      6u       /* total bytes on the wire                */
-#define PR_FLAG_VALID     0x01u    /* frame[4] bit0: source reading is valid */
+
+/* frame[4] FLAGS bits (battery sag monitor state, decided on the translator) */
+#define PR_FLAG_VALID     0x01u    /* a real source is present               */
+#define PR_FLAG_LOW       0x02u    /* 3.2-3.6 V/cell: sag warning ("LOW")    */
+#define PR_FLAG_CRIT      0x04u    /* < 3.2 V/cell: critical, Power FET cut  */
+#define PR_FLAG_FET_ON    0x08u    /* Power FET currently enabled            */
 
 /* XOR of the first n bytes -- the frame's integrity byte. */
 static inline uint8_t pr_xor(const uint8_t *b, uint32_t n)

@@ -31,10 +31,17 @@ Implemented:
   calls `i2c1_master_recover()` (SWRST) so a stuck-BUSY from start-up NACKs
   self-heals — no manual reset needed when the sim boots later than the
   translator.
-- **Power FET** (Task 1) — N-channel gate on **PA1**, active-high. Driven high
-  only when a battery is detected and its per-cell voltage is within
-  `[3.2 V, 4.2 V]`; `g_fet_on` / `g_cell_mv` expose the state over SWD. Starts
-  low (fail-safe).
+- **Power FET + sag monitor** (Task 1 + 2) — N-channel gate on **PA1**,
+  active-high, starts low (fail-safe). The cell count is **latched at plug-in**
+  (so a sagging pack isn't re-counted as fewer cells and mask the sag), and
+  per-cell voltage against that count picks one of three bands:
+  | per-cell        | band     | FET | sim shows          |
+  |-----------------|----------|-----|--------------------|
+  | 3.6 – 4.2 V     | charged  | ON  | `IN:6S 22.75V`     |
+  | 3.2 – 3.6 V     | low/sag  | ON  | `…V LOW`           |
+  | < 3.2 V         | critical | OFF | `…(x_X)`           |
+  The band is sent to the sim in the frame flags; `g_fet_on` / `g_cell_mv`
+  expose state over SWD.
 - **PC13 heartbeat** (~2 Hz).
 
 Bench check: a 22.94 V 6S pack read 2.528 V at PA0 → 22.75 V computed → `6S`

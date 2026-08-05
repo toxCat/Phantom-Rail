@@ -38,8 +38,14 @@
 /* Bench bring-up aid: when set, row1 shows the I2C1 link counters
  * "A<addr-hits> F<frames> x<flags>" instead of the stubbed OUT, and row0 shows
  * the received value as soon as ANY frame parses (ignoring the valid flag).
- * Set to 0 once the link is trusted to restore the normal OUT display. */
-#define LINK_DEBUG 1
+ * Left at 0 in normal operation (row1 = OUT substitute). */
+#define LINK_DEBUG 0
+
+/* Sag-warning text appended to the IN row, decided by the translator and sent
+ * in the frame flags (PR_FLAG_LOW / PR_FLAG_CRIT). */
+#define WARN_NONE 0   /* charged: no text            */
+#define WARN_LOW  1   /* 3.2-3.6 V/cell: "LOW"       */
+#define WARN_CRIT 2   /* < 3.2 V/cell: "(x_X)"       */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -101,17 +107,27 @@ static void fmt_volts(char *buf, uint32_t mv)
 /* Cell detection now lives on the translator (it owns the ADC); the sim just
  * displays the cell count it receives over I2C1. */
 
-/* Build a padded 16-char row (+NUL) and push it at the given line. */
-static void draw_in(uint8_t s, uint32_t mv)
+/* Build the 16-char IN row and push it. Layout: "IN:nS XX.XX" then a warning
+ * field. Charged keeps the 'V' suffix; LOW appends " LOW"; CRIT drops the 'V'
+ * to fit the 5-char "(x_X)" emoji exactly inside 16 columns.
+ *   charged: "IN:6S 22.75V    "
+ *   low:     "IN:6S 21.30V LOW"
+ *   crit:    "IN:6S 18.00(x_X)"  */
+static void draw_in(uint8_t s, uint32_t mv, uint8_t warn)
 {
     char v[6], line[17];
-    int n = 0;
     fmt_volts(v, mv);
-    line[n++] = 'I'; line[n++] = 'N'; line[n++] = ':';
-    line[n++] = (char)('0' + s); line[n++] = 'S'; line[n++] = ' ';
-    for (int i = 0; i < 5; i++) line[n++] = v[i];
-    line[n++] = 'V';
-    while (n < 16) line[n++] = ' ';
+    line[0] = 'I'; line[1] = 'N'; line[2] = ':';
+    line[3] = (char)('0' + (s > 9U ? 9U : s)); line[4] = 'S'; line[5] = ' ';
+    for (int i = 0; i < 5; i++) line[6 + i] = v[i];   /* "XX.XX" -> cols 6..10 */
+
+    if (warn == WARN_CRIT) {
+        line[11] = '('; line[12] = 'x'; line[13] = '_'; line[14] = 'X'; line[15] = ')';
+    } else {
+        line[11] = 'V';
+        if (warn == WARN_LOW) { line[12] = ' '; line[13] = 'L'; line[14] = 'O'; line[15] = 'W'; }
+        else                  { line[12] = ' '; line[13] = ' '; line[14] = ' '; line[15] = ' '; }
+    }
     line[16] = '\0';
     lcd_set_cursor(0, 0);
     lcd_print(line);
@@ -270,6 +286,11 @@ int main(void)
     i2c1_slave_get(&in_mv, &cells, &flags);
     uint32_t age = i2c1_slave_age_ms();       /* 0xFFFFFFFF until a frame parses */
 
+    /* Map the translator's sag flags to the warning appended on the IN row. */
+    uint8_t warn = WARN_NONE;
+    if (flags & PR_FLAG_CRIT)     warn = WARN_CRIT;
+    else if (flags & PR_FLAG_LOW) warn = WARN_LOW;
+
 #if LINK_DEBUG
     /* Bring-up view: row0 = received value the moment any frame parses (ignore
      * the valid flag), row1 = link counters. Read row1 to localize a failure:
@@ -277,7 +298,7 @@ int main(void)
      *   A>0 F0   -> addressed, but bytes/parse failed (framing)
      *   A>0 F>0  -> link works; if row0 reads 00.00V the ADC is the problem */
     if (lcd_addr) {
-      if (age != 0xFFFFFFFFU) draw_in(cells, in_mv);
+      if (age != 0xFFFFFFFFU) draw_in(cells, in_mv, warn);
       else                    draw_in_stale();
       uint32_t hits, frames;
       i2c1_slave_diag(&hits, &frames);
@@ -285,10 +306,11 @@ int main(void)
     }
     int live = (age < 1500U);
 #else
-    /* Normal view: trust the reading only if flagged valid AND recent. */
+    /* Normal view: trust the reading only if flagged valid AND recent. Row0 =
+     * IN + sag warning; row1 = OUT (substitute until FC control lands). */
     int live = (flags & PR_FLAG_VALID) && (age < 1500U);
     if (lcd_addr) {
-      if (live) draw_in(cells, in_mv);
+      if (live) draw_in(cells, in_mv, warn);
       else      draw_in_stale();
       draw_out(12000U);        /* OUT: stubbed LM51772 setpoint (12.00 V) */
     }

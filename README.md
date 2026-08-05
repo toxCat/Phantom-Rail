@@ -41,14 +41,17 @@ renders it.
 
 ## Status
 
-- `translator/` — **detects the pack and drives the link.** Register-level
-  ADC1_IN0 reader (PA0, /9 → `g_source_mv`), Betaflight-style cell-count
-  detection, and a register-level I2C1 **master** that pushes each reading to
-  the sim. PC13 heartbeat. TODO: USART1/MSP, UVLO/hysteresis, selector logic.
+- `translator/` — **detects the pack, drives the link, gates the Power FET.**
+  Register-level ADC1_IN0 reader (PA0, /9 → `g_source_mv`), cell-count
+  detection latched at plug-in, a 3-band sag monitor driving an N-channel
+  **Power FET on PA1** (charged → on, `LOW` → on, `<3.2 V/cell` → off), and a
+  register-level I2C1 **master** that pushes each reading (self-healing on a
+  start-up NACK). PC13 heartbeat. TODO: USART1/MSP, current cutoff (Task 3).
 - `lm51772-sim/` — **displays the real source over I2C1.** Interrupt-driven
-  I2C1 **slave** feeds the LCD's `IN:nS XX.XXV` row (shows `--` on link loss);
-  register-level hardware-I2C2 LCD driver (PCF8574 + HD44780, address
-  auto-detect); PC13 heartbeat. OUT is still a stubbed LM51772 setpoint.
+  I2C1 **slave** feeds the LCD's `IN:nS XX.XXV` row with the sag warning
+  (`LOW` / `(x_X)`); register-level hardware-I2C2 LCD driver (PCF8574 +
+  HD44780, address auto-detect); PC13 heartbeat. OUT (row1) is a stubbed
+  LM51772 setpoint.
 
 ## Build & flash
 

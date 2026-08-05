@@ -29,11 +29,16 @@ Register-level CMSIS (HAL generated but unused). Builds independently:
   the real source voltage + cell count from the translator. Shows
   `IN:--S --.--V` until a valid frame arrives or if the link goes stale
   (>1.5 s).
+- **Display** — row0 (IN) shows the received source plus the translator's sag
+  warning: `IN:6S 22.75V` charged, `…V LOW` in the 3.2-3.6 V/cell band, or
+  `…(x_X)` below 3.2 V/cell. Row1 (OUT) is a stubbed LM51772 setpoint until FC
+  control lands. A `LINK_DEBUG` toggle in `main.c` swaps row1 for I2C1 link
+  counters during bring-up.
 - **PC13 heartbeat** — 3 flashes at boot (proof of running from flash), then
-  ~2 Hz when live source frames are arriving / ~5 Hz when the link is idle.
+  ~2 Hz when live source frames are arriving / ~3 Hz when the link is idle.
 
 The link needs external pull-ups on SDA/SCL and a common ground — see the root
-README. TODO: the LM51772 OUT setpoint (row1) is still stubbed at 12.00 V.
+README.
 
 ## Notes / gotchas
 
