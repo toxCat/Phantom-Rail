@@ -23,4 +23,9 @@ int i2c1_slave_get(uint16_t *vin_mv, uint8_t *cells, uint8_t *flags);
  * Returns a large value if no frame has ever arrived. */
 uint32_t i2c1_slave_age_ms(void);
 
+/* Bring-up diagnostics: total address matches seen on the bus, and total valid
+ * frames parsed. addr_hits==0 => the master never reached us; addr_hits>0 with
+ * frames==0 => addressed but the bytes/parse failed. */
+void i2c1_slave_diag(uint32_t *addr_hits, uint32_t *frames);
+
 #endif /* I2C1_SLAVE_H */

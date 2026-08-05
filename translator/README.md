@@ -12,8 +12,9 @@ Register-level CMSIS, no HAL. Builds independently: `make` → `build/translator
 | Source sense      | PA0        | ADC1_IN0, via 120k/15k divider (/9, ~29 V full scale) |
 | FC UART           | PA9 / PA10 | USART1 TX/RX ↔ FC (MSP) |
 | Sim link          | PB6 / PB7  | **I2C1 master** → Black Pill #2 |
+| Power FET gate    | PA1        | N-channel Power FET enable, active-high |
 | Status LED        | PC13       | on-board LED (active low) |
-| Enable / selectors| TBD        | enable-disable out + 4 static selectors in |
+| Selectors         | TBD        | 4 static selectors in |
 
 ## Status
 
@@ -26,7 +27,14 @@ Implemented:
 - **I2C1 master** (`Core/Src/i2c1_master.c`) — register-level, standard-mode
   100 kHz on PB6/PB7. Each ~250 ms it builds a telemetry frame
   (`../Protocol/phantom_link.h`) and writes it to the sim at `0x42`;
-  `g_link_ok` reflects whether the last push was ACKed.
+  `g_link_ok` reflects whether the last push was ACKed. On a failed push it
+  calls `i2c1_master_recover()` (SWRST) so a stuck-BUSY from start-up NACKs
+  self-heals — no manual reset needed when the sim boots later than the
+  translator.
+- **Power FET** (Task 1) — N-channel gate on **PA1**, active-high. Driven high
+  only when a battery is detected and its per-cell voltage is within
+  `[3.2 V, 4.2 V]`; `g_fet_on` / `g_cell_mv` expose the state over SWD. Starts
+  low (fail-safe).
 - **PC13 heartbeat** (~2 Hz).
 
 Bench check: a 22.94 V 6S pack read 2.528 V at PA0 → 22.75 V computed → `6S`

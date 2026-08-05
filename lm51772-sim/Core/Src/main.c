@@ -35,7 +35,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* Bench bring-up aid: when set, row1 shows the I2C1 link counters
+ * "A<addr-hits> F<frames> x<flags>" instead of the stubbed OUT, and row0 shows
+ * the received value as soon as ANY frame parses (ignoring the valid flag).
+ * Set to 0 once the link is trusted to restore the normal OUT display. */
+#define LINK_DEBUG 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -121,7 +125,41 @@ static void draw_in_stale(void)
     lcd_print("IN:--S --.--V   ");
 }
 
-static void draw_out(uint32_t mv)
+#if LINK_DEBUG
+/* Write v as decimal into d (max 5 digits); return the number of chars. */
+static int put_u16(char *d, uint16_t v)
+{
+    char tmp[5];
+    int  i = 0;
+    if (v == 0) { d[0] = '0'; return 1; }
+    while (v && i < 5) { tmp[i++] = (char)('0' + v % 10U); v /= 10U; }
+    for (int j = 0; j < i; j++) d[j] = tmp[i - 1 - j];
+    return i;
+}
+static char hex_nib(uint8_t nib) { return (char)(nib < 10 ? '0' + nib : 'A' + nib - 10); }
+
+/* Row1 diagnostic: "A<hits> F<frames> x<flags>" (counters capped at 9999). */
+static void draw_diag(uint32_t hits, uint32_t frames, uint8_t flags)
+{
+    char line[17];
+    int  n = 0;
+    line[n++] = 'A';
+    n += put_u16(line + n, (uint16_t)(hits   > 9999U ? 9999U : hits));
+    line[n++] = ' ';
+    line[n++] = 'F';
+    n += put_u16(line + n, (uint16_t)(frames > 9999U ? 9999U : frames));
+    line[n++] = ' ';
+    line[n++] = 'x';
+    line[n++] = hex_nib((uint8_t)(flags >> 4));
+    line[n++] = hex_nib((uint8_t)(flags & 0x0F));
+    while (n < 16) line[n++] = ' ';
+    line[16] = '\0';
+    lcd_set_cursor(0, 1);
+    lcd_print(line);
+}
+#endif /* LINK_DEBUG */
+
+__attribute__((unused)) static void draw_out(uint32_t mv)
 {
     char v[6], line[17];
     int n = 0;
@@ -226,24 +264,41 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* Latest source telemetry from the translator over I2C1. Treat it as live
-     * only if it's flagged valid AND recent (guards against a pulled link). */
+    /* Latest source telemetry from the translator over I2C1. */
     uint16_t in_mv;
     uint8_t  cells, flags;
     i2c1_slave_get(&in_mv, &cells, &flags);
-    int have_src = (flags & PR_FLAG_VALID) && (i2c1_slave_age_ms() < 1500U);
+    uint32_t age = i2c1_slave_age_ms();       /* 0xFFFFFFFF until a frame parses */
 
+#if LINK_DEBUG
+    /* Bring-up view: row0 = received value the moment any frame parses (ignore
+     * the valid flag), row1 = link counters. Read row1 to localize a failure:
+     *   A0  F0   -> master never reached us (wiring / master / addressing)
+     *   A>0 F0   -> addressed, but bytes/parse failed (framing)
+     *   A>0 F>0  -> link works; if row0 reads 00.00V the ADC is the problem */
     if (lcd_addr) {
-      if (have_src) draw_in(cells, in_mv);
-      else          draw_in_stale();
+      if (age != 0xFFFFFFFFU) draw_in(cells, in_mv);
+      else                    draw_in_stale();
+      uint32_t hits, frames;
+      i2c1_slave_diag(&hits, &frames);
+      draw_diag(hits, frames, flags);
+    }
+    int live = (age < 1500U);
+#else
+    /* Normal view: trust the reading only if flagged valid AND recent. */
+    int live = (flags & PR_FLAG_VALID) && (age < 1500U);
+    if (lcd_addr) {
+      if (live) draw_in(cells, in_mv);
+      else      draw_in_stale();
       draw_out(12000U);        /* OUT: stubbed LM51772 setpoint (12.00 V) */
     }
+#endif
 
     /* Heartbeat encodes link state without needing the LCD:
      *   ~2 Hz  = live source frames arriving
-     *   ~5 Hz  = running but no valid source / link idle */
+     *   ~3 Hz  = running but no live source / link idle */
     led_toggle();
-    lcd_delay_ms(have_src ? 250U : 100U);
+    lcd_delay_ms(live ? 250U : 150U);
   }
   /* USER CODE END 3 */
 }

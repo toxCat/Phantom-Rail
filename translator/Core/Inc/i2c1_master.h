@@ -18,4 +18,9 @@ void i2c1_master_init(void);
  * Never blocks indefinitely. */
 int i2c1_master_write(uint8_t addr7, const uint8_t *data, uint32_t len);
 
+/* Reset the I2C1 peripheral to clear a wedged/stuck-BUSY state. Call after a
+ * failed write so the master self-heals (e.g. once the slave finishes booting)
+ * instead of needing a manual reset. */
+void i2c1_master_recover(void);
+
 #endif /* I2C1_MASTER_H */

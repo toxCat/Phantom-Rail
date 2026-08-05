@@ -40,11 +40,24 @@
 #define CELL_MAX_MV 4300U  /* per-cell ceiling used for the S estimate   */
 #define SRC_MIN_MV  5000U  /* below this: nothing meaningful is connected */
 
+/* ---- Power FET (Task 1) ----
+ * N-channel Power FET gate on PA1, active-high: drive high to enable the power
+ * path once a battery is detected AND its per-cell voltage sits within the
+ * healthy window [CELL_LO_MV, CELL_HI_MV]. (Task 2 subdivides this window with
+ * an intermediate "LOW" warning tier and the flat-pack cutoff.) */
+#define PWRFET_PIN  1U     /* PA1 */
+#define CELL_LO_MV  3200U  /* min healthy cell voltage (below -> FET off) */
+#define CELL_HI_MV  4200U  /* max healthy cell voltage (above -> FET off) */
+
 /* Latest values, exposed (volatile, non-static) so they survive -Og and can
  * be watched over SWD. */
 volatile uint32_t g_source_mv = 0;   /* source voltage, millivolts */
 volatile uint8_t  g_cells     = 0;   /* detected LiPo cell count   */
 volatile uint8_t  g_link_ok   = 0;   /* 1 = last I2C1 push was ACKed */
+volatile uint16_t g_adc_raw   = 0;   /* last raw ADC count (0..4095) */
+volatile uint8_t  g_adc_ok    = 0;   /* 1 = last conversion completed */
+volatile uint16_t g_cell_mv   = 0;   /* per-cell voltage, millivolts */
+volatile uint8_t  g_fet_on    = 0;   /* Power FET state driven on PA1 */
 
 /* -------- microsecond delays via the DWT cycle counter -------- */
 static void dwt_init(void)
@@ -73,6 +86,20 @@ static void led_init(void)
 }
 static inline void led_toggle(void) { GPIOC->ODR ^= (1u << 13); }
 
+/* -------- Power FET gate on PA1 (active-high, Task 1) -------- */
+static void pwrfet_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;          /* (also on for the ADC) */
+    GPIOA->MODER &= ~(3u << (PWRFET_PIN * 2));
+    GPIOA->MODER |=  (1u << (PWRFET_PIN * 2));     /* general-purpose output */
+    GPIOA->ODR   &= ~(1u << PWRFET_PIN);           /* start OFF (fail-safe) */
+}
+static inline void pwrfet_set(uint8_t on)
+{
+    if (on) GPIOA->ODR |=  (1u << PWRFET_PIN);
+    else    GPIOA->ODR &= ~(1u << PWRFET_PIN);
+}
+
 /* -------- ADC1_IN0 on PA0 (source sense) -------- */
 static void adc_init(void)
 {
@@ -93,12 +120,19 @@ static void adc_init(void)
     delay_us(10);                    /* tSTAB settling */
 }
 
-/* One blocking single conversion of channel 0. */
+/* One single conversion of channel 0, with a timeout so a mis-configured ADC
+ * can never wedge the control loop (and silence the I2C link). */
 static uint16_t adc_read(void)
 {
     ADC1->CR2 |= ADC_CR2_SWSTART;
-    while (!(ADC1->SR & ADC_SR_EOC)) { }
-    return (uint16_t)ADC1->DR;       /* reading DR clears EOC */
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = 2000U * (SystemCoreClock / 1000000U);   /* 2 ms budget */
+    while (!(ADC1->SR & ADC_SR_EOC)) {
+        if ((DWT->CYCCNT - start) > ticks) { g_adc_ok = 0; return 0; }
+    }
+    g_adc_ok  = 1;
+    g_adc_raw = (uint16_t)ADC1->DR;  /* reading DR clears EOC */
+    return g_adc_raw;
 }
 
 int main(void)
@@ -107,6 +141,7 @@ int main(void)
     dwt_init();
     led_init();
     adc_init();
+    pwrfet_init();                   /* Power FET gate on PA1, starts OFF */
     i2c1_master_init();              /* link to the LM51772 sim (PB6/PB7) */
 
     for (;;) {
@@ -125,12 +160,27 @@ int main(void)
         }
         g_cells = cells;
 
-        /* 3. Push the telemetry frame to the sim over I2C1. u16 caps at
+        /* 3. Power FET (Task 1): enable the power path only when a battery is
+         *    detected and its per-cell voltage is within the healthy window. */
+        uint16_t per_cell = (cells > 0) ? (uint16_t)(src_mv / cells) : 0U;
+        g_cell_mv = per_cell;
+        uint8_t fet_on = (flags & PR_FLAG_VALID) && (cells > 0) &&
+                         (per_cell >= CELL_LO_MV) && (per_cell <= CELL_HI_MV);
+        pwrfet_set(fet_on);
+        g_fet_on = fet_on;
+
+        /* 4. Push the telemetry frame to the sim over I2C1. u16 caps at
          *    65.535 V, far above any pack we sense. */
         uint16_t vin16 = (src_mv > 65535U) ? 65535U : (uint16_t)src_mv;
         uint8_t  frame[PR_FRAME_LEN];
         pr_build_telemetry(frame, vin16, cells, flags);
         g_link_ok = (uint8_t)i2c1_master_write(PR_I2C_ADDR, frame, PR_FRAME_LEN);
+        if (!g_link_ok) {
+            /* Slave not answering yet (still booting) or bus wedged: reset the
+             * peripheral so the next attempt is clean and we self-heal without
+             * a manual translator reset. */
+            i2c1_master_recover();
+        }
 
         led_toggle();                /* ~2 Hz heartbeat = alive + sampling */
         delay_ms(250);

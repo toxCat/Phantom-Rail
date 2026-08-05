@@ -17,6 +17,12 @@ static volatile uint8_t  s_fresh  = 0;   /* set on new frame, cleared on read */
 static volatile uint8_t  s_have   = 0;   /* 1 once any valid frame arrived */
 static volatile uint32_t s_stamp  = 0;   /* DWT cycle count at last frame  */
 
+/* Link diagnostics (bench bring-up): how many times our address was matched
+ * on the bus, and how many valid frames we parsed. Divergence tells us exactly
+ * where the link breaks (see i2c1_slave_diag). */
+static volatile uint32_t s_addr_hits = 0;
+static volatile uint32_t s_frames    = 0;
+
 /* Validate the just-received buffer and latch it if it's a good frame. */
 static void slave_commit(void)
 {
@@ -29,6 +35,7 @@ static void slave_commit(void)
         s_stamp = DWT->CYCCNT;
         s_have  = 1;
         s_fresh = 1;
+        s_frames++;
     }
     s_rxlen = 0;
 }
@@ -83,6 +90,7 @@ void I2C1_EV_IRQHandler(void)
     if (sr1 & I2C_SR1_ADDR) {          /* addressed: clear ADDR (SR1 read + SR2 read) */
         (void)I2C1->SR2;
         s_rxlen = 0;
+        s_addr_hits++;
     }
     if (sr1 & I2C_SR1_RXNE) {          /* data byte from the master */
         uint8_t d = (uint8_t)I2C1->DR;
@@ -125,4 +133,10 @@ uint32_t i2c1_slave_age_ms(void)
     if (!s_have) return 0xFFFFFFFFu;
     uint32_t cyc = DWT->CYCCNT - s_stamp;          /* unsigned delta wraps fine */
     return cyc / (SystemCoreClock / 1000U);
+}
+
+void i2c1_slave_diag(uint32_t *addr_hits, uint32_t *frames)
+{
+    *addr_hits = s_addr_hits;   /* 32-bit reads are atomic on Cortex-M4 */
+    *frames    = s_frames;
 }

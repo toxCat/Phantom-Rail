@@ -23,6 +23,24 @@ static uint8_t wait_sr1(uint32_t flag)
     }
 }
 
+/* (Re)configure the I2C1 peripheral registers. The SWRST clears a stuck BUSY
+ * or any latched error, so this doubles as the bus-recovery routine. Timing is
+ * derived from PCLK1 (APB1 prescaler PPRE1 = RCC->CFGR[12:10]). */
+static void periph_config(void)
+{
+    uint32_t pclk1 = SystemCoreClock;
+    uint32_t ppre1 = (RCC->CFGR >> 10) & 0x7u;
+    if (ppre1 >= 4u) pclk1 >>= (ppre1 - 3u);
+    uint32_t freq_mhz = pclk1 / 1000000U;
+
+    I2C1->CR1 = I2C_CR1_SWRST;                    /* hold in reset...      */
+    I2C1->CR1 = 0;                                /* ...release            */
+    I2C1->CR2   = freq_mhz & I2C_CR2_FREQ;        /* APB1 clock in MHz     */
+    I2C1->CCR   = pclk1 / (2U * 100000U);         /* std mode -> 100 kHz   */
+    I2C1->TRISE = freq_mhz + 1U;                  /* std-mode max rise 1us */
+    I2C1->CR1  |= I2C_CR1_PE;                      /* enable                */
+}
+
 void i2c1_master_init(void)
 {
     /* Peripheral + port clocks */
@@ -44,21 +62,15 @@ void i2c1_master_init(void)
     GPIOB->AFR[0] &= ~((0xFu << (SCL_PIN * 4)) | (0xFu << (SDA_PIN * 4)));
     GPIOB->AFR[0] |=  ((4u   << (SCL_PIN * 4)) | (4u   << (SDA_PIN * 4)));
 
-    /* Derive PCLK1 (APB1) from SystemCoreClock and the APB1 prescaler
-     * (RCC->CFGR PPRE1, bits [12:10]: 0xx=/1, 100=/2, 101=/4, 110=/8, 111=/16). */
-    uint32_t pclk1 = SystemCoreClock;
-    uint32_t ppre1 = (RCC->CFGR >> 10) & 0x7u;
-    if (ppre1 >= 4u) pclk1 >>= (ppre1 - 3u);
-    uint32_t freq_mhz = pclk1 / 1000000U;
+    periph_config();
+}
 
-    /* Reset, then configure while disabled (PE = 0) */
-    I2C1->CR1 = I2C_CR1_SWRST;
-    I2C1->CR1 = 0;
-
-    I2C1->CR2   = freq_mhz & I2C_CR2_FREQ;        /* APB1 clock in MHz     */
-    I2C1->CCR   = pclk1 / (2U * 100000U);         /* std mode -> 100 kHz   */
-    I2C1->TRISE = freq_mhz + 1U;                  /* std-mode max rise 1us */
-    I2C1->CR1  |= I2C_CR1_PE;                      /* enable                */
+/* Recover a wedged bus (e.g. a stuck BUSY after the slave NACKed our early
+ * start-up frames before it was listening). Cheap: SWRST + re-enable, no GPIO
+ * churn. Call after a failed transfer so the next attempt starts clean. */
+void i2c1_master_recover(void)
+{
+    periph_config();
 }
 
 int i2c1_master_write(uint8_t addr7, const uint8_t *data, uint32_t len)
