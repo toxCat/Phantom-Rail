@@ -52,6 +52,12 @@
 #define CELL_LOW_MV  3600U /* 3.2-3.6: sag warning, FET stays on            */
 #define CELL_HI_MV   4200U /* 3.6-4.2: charged; above: over-voltage guard   */
 
+/* ---- Over-current soft-fail (Task 3) ----
+ * The sim reads the ACS709 on the Vsw/ESC line and reports current over I2C1.
+ * The translator latches a cutoff at CUR_LIMIT_MA and holds the FET off until
+ * the pack is removed (re-arm). The translator never senses current directly. */
+#define CUR_LIMIT_MA 2000U /* 2.0 A soft limit */
+
 /* Latest values, exposed (volatile, non-static) so they survive -Og and can
  * be watched over SWD. */
 volatile uint32_t g_source_mv = 0;   /* source voltage, millivolts */
@@ -61,6 +67,8 @@ volatile uint16_t g_adc_raw   = 0;   /* last raw ADC count (0..4095) */
 volatile uint8_t  g_adc_ok    = 0;   /* 1 = last conversion completed */
 volatile uint16_t g_cell_mv   = 0;   /* per-cell voltage, millivolts */
 volatile uint8_t  g_fet_on    = 0;   /* Power FET state driven on PA1 */
+volatile uint16_t g_current_ma = 0;  /* current reported by the sim (mA) */
+volatile uint8_t  g_oc_fault  = 0;   /* 1 = over-current cutoff latched */
 
 /* -------- microsecond delays via the DWT cycle counter -------- */
 static void dwt_init(void)
@@ -166,29 +174,55 @@ int main(void)
         }
         uint8_t cells = g_cells;
 
-        /* 3. Sag monitor + Power FET (Task 2). Per-cell voltage against the
-         *    latched count sorts into charged / low / critical; the FET stays
-         *    on through the LOW band and only cuts below the critical floor. */
+        /* 3. Sag monitor -> base FET decision (Task 2). Per-cell voltage
+         *    against the latched count sorts into charged / low / critical;
+         *    the FET is permitted through LOW and cut below the critical floor. */
         uint16_t per_cell = (cells > 0) ? (uint16_t)(src_mv / cells) : 0U;
         g_cell_mv = per_cell;
 
-        uint8_t fet_on = 0;
+        uint8_t base_fet = 0;
         if (flags & PR_FLAG_VALID) {
             if (per_cell < CELL_CRIT_MV) {
                 flags |= PR_FLAG_CRIT;    /* < 3.2 V: critical -> FET off */
             } else if (per_cell < CELL_LOW_MV) {
                 flags |= PR_FLAG_LOW;     /* 3.2-3.6 V: sag warning       */
-                fet_on = 1;
+                base_fet = 1;
             } else if (per_cell <= CELL_HI_MV) {
-                fet_on = 1;               /* 3.6-4.2 V: charged           */
+                base_fet = 1;             /* 3.6-4.2 V: charged           */
             }
             /* > 4.2 V (over-voltage / bad reading): leave FET off, no warning */
         }
+
+        /* 4. Read the sim's ACS709 current over I2C1 and latch the over-current
+         *    soft-fail (Task 3). The latch clears only when the pack is removed. */
+        uint8_t  cf[PR_CUR_FRAME_LEN];
+        uint16_t cur_ma = 0;
+        uint8_t  cvalid = 0;
+        if (i2c1_master_read(PR_I2C_ADDR, cf, PR_CUR_FRAME_LEN)) {
+            uint16_t ima; uint8_t cflags;
+            if (pr_parse_current(cf, PR_CUR_FRAME_LEN, &ima, &cflags)) {
+                cur_ma = ima;
+                cvalid = (uint8_t)(cflags & PR_CFLAG_VALID);
+            }
+        } else {
+            i2c1_master_recover();
+        }
+        g_current_ma = cur_ma;
+
+        if (!(flags & PR_FLAG_VALID)) {
+            g_oc_fault = 0;               /* pack removed -> re-arm */
+        } else if (cvalid && cur_ma >= CUR_LIMIT_MA) {
+            g_oc_fault = 1;               /* soft fail: latch the FET off */
+        }
+
+        /* 5. Final FET state: sag-permitted AND not over-current. */
+        uint8_t fet_on = (uint8_t)(base_fet && !g_oc_fault);
         pwrfet_set(fet_on);
         g_fet_on = fet_on;
-        if (fet_on) flags |= PR_FLAG_FET_ON;
+        if (fet_on)     flags |= PR_FLAG_FET_ON;
+        if (g_oc_fault) flags |= PR_FLAG_OC;
 
-        /* 4. Push the telemetry frame to the sim over I2C1. u16 caps at
+        /* 6. Push the telemetry frame to the sim over I2C1. u16 caps at
          *    65.535 V, far above any pack we sense. */
         uint16_t vin16 = (src_mv > 65535U) ? 65535U : (uint16_t)src_mv;
         uint8_t  frame[PR_FRAME_LEN];
@@ -201,7 +235,7 @@ int main(void)
             i2c1_master_recover();
         }
 
-        led_toggle();                /* ~2 Hz heartbeat = alive + sampling */
-        delay_ms(250);
+        led_toggle();                /* heartbeat = alive + sampling */
+        delay_ms(100);
     }
 }

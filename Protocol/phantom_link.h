@@ -32,6 +32,17 @@
 #define PR_FLAG_LOW       0x02u    /* 3.2-3.6 V/cell: sag warning ("LOW")    */
 #define PR_FLAG_CRIT      0x04u    /* < 3.2 V/cell: critical, Power FET cut  */
 #define PR_FLAG_FET_ON    0x08u    /* Power FET currently enabled            */
+#define PR_FLAG_OC        0x10u    /* over-current soft-fail latched (FET cut) */
+
+/* Reverse direction: a master READ of the slave returns the sim's ACS709
+ * current reading (Task 3). Current-telemetry frame, PR_CUR_FRAME_LEN bytes:
+ *   [0] I_L    current milliamps, low byte   (u16 little-endian)
+ *   [1] I_H    current milliamps, high byte
+ *   [2] CFLAGS bit0 = PR_CFLAG_VALID (sensor reading valid)
+ *   [3] XOR    XOR of bytes [0..2]
+ */
+#define PR_CUR_FRAME_LEN  4u
+#define PR_CFLAG_VALID    0x01u
 
 /* XOR of the first n bytes -- the frame's integrity byte. */
 static inline uint8_t pr_xor(const uint8_t *b, uint32_t n)
@@ -65,6 +76,27 @@ static inline int pr_parse_telemetry(const uint8_t *buf, uint32_t len,
     *vin_mv = (uint16_t)((uint16_t)buf[1] | ((uint16_t)buf[2] << 8));
     *cells  = buf[3];
     *flags  = buf[4];
+    return 1;
+}
+
+/* Fill buf (>= PR_CUR_FRAME_LEN) with a current-telemetry frame (slave side). */
+static inline void pr_build_current(uint8_t *buf, uint16_t i_ma, uint8_t cflags)
+{
+    buf[0] = (uint8_t)(i_ma & 0xFFu);
+    buf[1] = (uint8_t)(i_ma >> 8);
+    buf[2] = cflags;
+    buf[3] = pr_xor(buf, 3);
+}
+
+/* Validate and unpack a current-telemetry frame (master side).
+ * Returns 1 on a good frame (out params written), 0 otherwise. */
+static inline int pr_parse_current(const uint8_t *buf, uint32_t len,
+                                   uint16_t *i_ma, uint8_t *cflags)
+{
+    if (len != PR_CUR_FRAME_LEN)  return 0;
+    if (buf[3] != pr_xor(buf, 3)) return 0;
+    *i_ma   = (uint16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8));
+    *cflags = buf[2];
     return 1;
 }
 

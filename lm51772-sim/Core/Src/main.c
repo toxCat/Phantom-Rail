@@ -46,6 +46,15 @@
 #define WARN_NONE 0   /* charged: no text            */
 #define WARN_LOW  1   /* 3.2-3.6 V/cell: "LOW"       */
 #define WARN_CRIT 2   /* < 3.2 V/cell: "(x_X)"       */
+
+/* ACS709 current sensor on PA0 (VIOUT -> A0), Task 3. Bidirectional Hall
+ * output = ACS_ZERO_MV at 0 A, rising ACS_SENS_MV_PER_A per amp. CALIBRATE to
+ * your part + supply: measure VIOUT at 0 A -> ACS_ZERO_MV, take the mV/A slope
+ * from the datasheet (or a known load). Power the sensor so VIOUT stays <=3V3. */
+#define ACS_VREF_MV        3300U
+#define ACS_ADC_MAX        4095U
+#define ACS_ZERO_MV        2500U   /* VIOUT at 0 A (nominal -35BB @ 5V) */
+#define ACS_SENS_MV_PER_A  28U     /* sensitivity, mV per amp          */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,7 +65,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+volatile uint16_t g_cur_ma = 0;   /* last ACS709 current reading (mA), for SWD */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -89,6 +98,42 @@ void SystemClock_Config(void);
  * generated HAL I2C init is deliberately left uncalled (see MX_I2C*_Init note
  * below).
  */
+
+/* -------- ACS709 current sense on PA0 (ADC1_IN0), Task 3 --------
+ * This board simulates the LM51772's internal current sensor: it reads the
+ * ACS709 VIOUT on A0 and reports amps to the translator over I2C1 (which cuts
+ * the Power FET at the limit). Register-level, mirrors the translator's ADC. */
+static void acs_init(void)
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+    GPIOA->MODER |=  (3u << (0 * 2));      /* PA0 -> analog */
+    GPIOA->PUPDR &= ~(3u << (0 * 2));
+    ADC1->SMPR2 |= ADC_SMPR2_SMP0;         /* channel 0: long sample time */
+    ADC1->SQR1   = 0;
+    ADC1->SQR3   = 0;                       /* 1st conversion = channel 0 */
+    ADC1->CR2   |= ADC_CR2_ADON;
+    lcd_delay_ms(1);                        /* tSTAB */
+}
+
+/* One conversion -> current in milliamps. *valid=0 on ADC timeout. */
+static uint16_t acs_read_ma(uint8_t *valid)
+{
+    ADC1->CR2 |= ADC_CR2_SWSTART;
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = 2000U * (SystemCoreClock / 1000000U);   /* 2 ms budget */
+    while (!(ADC1->SR & ADC_SR_EOC)) {
+        if ((DWT->CYCCNT - start) > ticks) { *valid = 0; return 0; }
+    }
+    uint16_t raw  = (uint16_t)ADC1->DR;
+    uint32_t v_mv = (uint32_t)raw * ACS_VREF_MV / ACS_ADC_MAX;
+    int32_t  dv   = (int32_t)v_mv - (int32_t)ACS_ZERO_MV;    /* signed offset */
+    if (dv < 0) dv = 0;                                       /* unidirectional load */
+    uint32_t ma   = (uint32_t)dv * 1000U / ACS_SENS_MV_PER_A;
+    if (ma > 60000U) ma = 60000U;
+    *valid = 1;
+    return (uint16_t)ma;
+}
 
 /* Format millivolts as exactly "XX.XX" (5 chars + NUL). */
 static void fmt_volts(char *buf, uint32_t mv)
@@ -175,15 +220,25 @@ static void draw_diag(uint32_t hits, uint32_t frames, uint8_t flags)
 }
 #endif /* LINK_DEBUG */
 
-__attribute__((unused)) static void draw_out(uint32_t mv)
+/* Row1 (OUT): substitute output voltage, then the measured current to the
+ * right as "X.XXA" (Task 3). e.g. "OUT:12.00V 1.85A". */
+__attribute__((unused)) static void draw_out(uint32_t mv, uint16_t cur_ma)
 {
     char v[6], line[17];
-    int n = 0;
     fmt_volts(v, mv);
-    line[n++] = 'O'; line[n++] = 'U'; line[n++] = 'T'; line[n++] = ':';
-    for (int i = 0; i < 5; i++) line[n++] = v[i];
-    line[n++] = 'V';
-    while (n < 16) line[n++] = ' ';
+    line[0] = 'O'; line[1] = 'U'; line[2] = 'T'; line[3] = ':';
+    for (int i = 0; i < 5; i++) line[4 + i] = v[i];   /* "XX.XX" -> cols 4..8 */
+    line[9] = 'V';
+
+    uint32_t aw = cur_ma / 1000U;             /* whole amps */
+    uint32_t ac = (cur_ma % 1000U) / 10U;     /* centi-amps (2 digits) */
+    if (aw > 9U) { aw = 9U; ac = 99U; }       /* single-digit field caps at 9.99 */
+    line[10] = ' ';
+    line[11] = (char)('0' + aw);
+    line[12] = '.';
+    line[13] = (char)('0' + ac / 10U);
+    line[14] = (char)('0' + ac % 10U);
+    line[15] = 'A';
     line[16] = '\0';
     lcd_set_cursor(0, 1);
     lcd_print(line);
@@ -263,6 +318,7 @@ int main(void)
   /* Bring up the I2C1 slave link regardless of the LCD: the translator can
    * start pushing frames the moment we ACK our address. */
   i2c1_slave_init(PR_I2C_ADDR);
+  acs_init();                    /* ACS709 current sense on PA0 (Task 3) */
 
   if (lcd_addr) {
     /* 1-2: splash, then clear */
@@ -280,6 +336,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* Task 3: sample the ACS709 and publish it for the translator to READ back
+     * (it makes the 2 A cutoff decision; we never gate our own FET). */
+    uint8_t  cvalid = 0;
+    uint16_t cur_ma = acs_read_ma(&cvalid);
+    g_cur_ma = cur_ma;
+    i2c1_slave_set_current(cur_ma, cvalid ? PR_CFLAG_VALID : 0U);
+
     /* Latest source telemetry from the translator over I2C1. */
     uint16_t in_mv;
     uint8_t  cells, flags;
@@ -312,7 +375,7 @@ int main(void)
     if (lcd_addr) {
       if (live) draw_in(cells, in_mv, warn);
       else      draw_in_stale();
-      draw_out(12000U);        /* OUT: stubbed LM51772 setpoint (12.00 V) */
+      draw_out(12000U, cur_ma);   /* OUT: stub setpoint (12.00 V) + measured A */
     }
 #endif
 

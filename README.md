@@ -28,10 +28,11 @@ the two I2C buses never collide.
 ## Inter-board link
 
 The I2C1 wire format lives in `Protocol/phantom_link.h`, `#include`d by both
-projects so master and slave can't drift. The master writes a 6-byte telemetry
-frame (`CMD, VIN_lo, VIN_hi, cells, flags, xor`) to slave address `0x42` each
-control cycle; the slave receives it under interrupt (clock-stretch-safe) and
-renders it.
+projects so master and slave can't drift. Each control cycle the master
+**writes** a 6-byte telemetry frame (`CMD, VIN_lo, VIN_hi, cells, flags, xor`)
+to slave `0x42`, then **reads** back a 4-byte current frame (`I_lo, I_hi,
+cflags, xor`) — the sim's ACS709 reading, which the translator uses for the 2 A
+cutoff. The slave services both directions under interrupt (clock-stretch-safe).
 
 **Wiring (do this before expecting anything on screen):**
 - `BP#1 PB6 (SCL) ── BP#2 PB6 (SCL)` and `BP#1 PB7 (SDA) ── BP#2 PB7 (SDA)`
@@ -44,14 +45,15 @@ renders it.
 - `translator/` — **detects the pack, drives the link, gates the Power FET.**
   Register-level ADC1_IN0 reader (PA0, /9 → `g_source_mv`), cell-count
   detection latched at plug-in, a 3-band sag monitor driving an N-channel
-  **Power FET on PA1** (charged → on, `LOW` → on, `<3.2 V/cell` → off), and a
-  register-level I2C1 **master** that pushes each reading (self-healing on a
-  start-up NACK). PC13 heartbeat. TODO: USART1/MSP, current cutoff (Task 3).
-- `lm51772-sim/` — **displays the real source over I2C1.** Interrupt-driven
-  I2C1 **slave** feeds the LCD's `IN:nS XX.XXV` row with the sag warning
-  (`LOW` / `(x_X)`); register-level hardware-I2C2 LCD driver (PCF8574 +
-  HD44780, address auto-detect); PC13 heartbeat. OUT (row1) is a stubbed
-  LM51772 setpoint.
+  **Power FET on PA1** (charged → on, `LOW` → on, `<3.2 V/cell` → off), a
+  register-level I2C1 **master** that pushes each reading and **reads back** the
+  sim's current, and a **2 A over-current soft-fail** that latches the FET off.
+  Self-heals on a start-up NACK. PC13 heartbeat. TODO: USART1/MSP, selectors.
+- `lm51772-sim/` — **displays source + current, sends current back over I2C1.**
+  Interrupt-driven I2C1 **slave** feeds the LCD's `IN:nS XX.XXV` row with the
+  sag warning (`LOW` / `(x_X)`), and on a master read returns its **ACS709
+  current** (PA0) — also shown on row1 as `OUT:12.00V X.XXA`. Register-level
+  hardware-I2C2 LCD driver (PCF8574 + HD44780, auto-detect); PC13 heartbeat.
 
 ## Build & flash
 

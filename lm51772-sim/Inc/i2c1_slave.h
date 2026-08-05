@@ -28,4 +28,8 @@ uint32_t i2c1_slave_age_ms(void);
  * frames==0 => addressed but the bytes/parse failed. */
 void i2c1_slave_diag(uint32_t *addr_hits, uint32_t *frames);
 
+/* Publish the latest ACS709 current (mA) + flags for the master to READ back
+ * (Task 3). Cheap to call every loop; the frame is swapped in atomically. */
+void i2c1_slave_set_current(uint16_t i_ma, uint8_t cflags);
+
 #endif /* I2C1_SLAVE_H */

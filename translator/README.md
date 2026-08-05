@@ -42,7 +42,12 @@ Implemented:
   | < 3.2 V         | critical | OFF | `…(x_X)`           |
   The band is sent to the sim in the frame flags; `g_fet_on` / `g_cell_mv`
   expose state over SWD.
-- **PC13 heartbeat** (~2 Hz).
+- **Over-current soft-fail** (Task 3) — each loop the master **reads** the
+  sim's ACS709 current back over I2C1 (`i2c1_master_read`) and latches a cutoff
+  at **2 A** (`CUR_LIMIT_MA`) that forces the FET off. The latch clears when the
+  pack is removed (re-arm). The translator never senses current directly.
+  `g_current_ma` / `g_oc_fault` expose state over SWD.
+- **PC13 heartbeat**.
 
 Bench check: a 22.94 V 6S pack read 2.528 V at PA0 → 22.75 V computed → `6S`
 detected (22.75/6 = 3.79 V/cell). The ~0.8 % low reading is resistor

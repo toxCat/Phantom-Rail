@@ -23,6 +23,14 @@ static volatile uint32_t s_stamp  = 0;   /* DWT cycle count at last frame  */
 static volatile uint32_t s_addr_hits = 0;
 static volatile uint32_t s_frames    = 0;
 
+/* Transmit side (Task 3): when the master READS us, we stream the current
+ * frame the main loop last published. s_dir_tx distinguishes a read (we
+ * transmit) from a write (we receive) so STOP doesn't parse a stale rx buf. */
+static volatile uint8_t  s_txbuf[8];
+static volatile uint8_t  s_txlen  = 0;
+static volatile uint8_t  s_txidx  = 0;
+static volatile uint8_t  s_dir_tx = 0;   /* 1 = current transfer is a master read */
+
 /* Validate the just-received buffer and latch it if it's a good frame. */
 static void slave_commit(void)
 {
@@ -88,21 +96,23 @@ void I2C1_EV_IRQHandler(void)
     uint32_t sr1 = I2C1->SR1;
 
     if (sr1 & I2C_SR1_ADDR) {          /* addressed: clear ADDR (SR1 read + SR2 read) */
-        (void)I2C1->SR2;
-        s_rxlen = 0;
+        uint32_t sr2 = I2C1->SR2;      /* SR2.TRA: 1 = we transmit (master read) */
+        s_dir_tx = (uint8_t)((sr2 & I2C_SR2_TRA) ? 1U : 0U);
+        s_rxlen  = 0;
+        s_txidx  = 0;
         s_addr_hits++;
     }
-    if (sr1 & I2C_SR1_RXNE) {          /* data byte from the master */
+    if (sr1 & I2C_SR1_RXNE) {          /* data byte from the master (write) */
         uint8_t d = (uint8_t)I2C1->DR;
         if (s_rxlen < sizeof(s_rxbuf)) s_rxbuf[s_rxlen++] = d;
     }
-    if (sr1 & I2C_SR1_TXE) {           /* master-read path (unused): keep bus moving */
-        I2C1->DR = 0x00;
+    if (sr1 & I2C_SR1_TXE) {           /* master read: feed the current frame */
+        I2C1->DR = (s_txidx < s_txlen) ? s_txbuf[s_txidx++] : 0x00U;
     }
     if (sr1 & I2C_SR1_STOPF) {         /* master issued STOP: clear (SR1 read + CR1 write) */
         (void)I2C1->SR1;
         I2C1->CR1 |= I2C_CR1_PE;
-        slave_commit();
+        if (!s_dir_tx) slave_commit();  /* only a write frame is parsed */
     }
 }
 
@@ -139,4 +149,14 @@ void i2c1_slave_diag(uint32_t *addr_hits, uint32_t *frames)
 {
     *addr_hits = s_addr_hits;   /* 32-bit reads are atomic on Cortex-M4 */
     *frames    = s_frames;
+}
+
+void i2c1_slave_set_current(uint16_t i_ma, uint8_t cflags)
+{
+    uint8_t tmp[PR_CUR_FRAME_LEN];
+    pr_build_current(tmp, i_ma, cflags);
+    __disable_irq();                       /* swap the TX frame atomically */
+    for (uint32_t i = 0; i < PR_CUR_FRAME_LEN; i++) s_txbuf[i] = tmp[i];
+    s_txlen = PR_CUR_FRAME_LEN;
+    __enable_irq();
 }

@@ -18,6 +18,11 @@ void i2c1_master_init(void);
  * Never blocks indefinitely. */
 int i2c1_master_write(uint8_t addr7, const uint8_t *data, uint32_t len);
 
+/* Read len bytes from the 7-bit address addr7 into buf (single START..STOP).
+ * Returns 1 on success, 0 on NACK / timeout. Implements the STM32F4 master
+ * receiver ACK/STOP dance so the final byte is NACKed correctly. */
+int i2c1_master_read(uint8_t addr7, uint8_t *buf, uint32_t len);
+
 /* Reset the I2C1 peripheral to clear a wedged/stuck-BUSY state. Call after a
  * failed write so the master self-heals (e.g. once the slave finishes booting)
  * instead of needing a manual reset. */
