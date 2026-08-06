@@ -43,10 +43,13 @@ Implemented:
   The band is sent to the sim in the frame flags; `g_fet_on` / `g_cell_mv`
   expose state over SWD.
 - **Over-current soft-fail** (Task 3) — each loop the master **reads** the
-  sim's ACS709 current back over I2C1 (`i2c1_master_read`) and latches a cutoff
-  at **2 A** (`CUR_LIMIT_MA`) that forces the FET off. The latch clears when the
-  pack is removed (re-arm). The translator never senses current directly.
-  `g_current_ma` / `g_oc_fault` expose state over SWD.
+  sim's ACS709 current back over I2C1 (`i2c1_master_read`). The cutoff is
+  **debounced**: the draw must stay ≥ **2 A** (`CUR_LIMIT_MA`) continuously for
+  `OC_DEBOUNCE_MS` (1 s) before the FET latches off, so a motor-ramp transient
+  doesn't nuisance-trip — the FET is the sustained-fault backstop, not a fast
+  limiter (the LM51772 handles that). The latch clears when the pack is removed
+  (re-arm). The translator never senses current directly. `g_current_ma` /
+  `g_oc_active` / `g_oc_fault` expose state over SWD.
 - **PC13 heartbeat**.
 
 Bench check: a 22.94 V 6S pack read 2.528 V at PA0 → 22.75 V computed → `6S`

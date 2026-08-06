@@ -54,9 +54,13 @@
 
 /* ---- Over-current soft-fail (Task 3) ----
  * The sim reads the ACS709 on the Vsw/ESC line and reports current over I2C1.
- * The translator latches a cutoff at CUR_LIMIT_MA and holds the FET off until
- * the pack is removed (re-arm). The translator never senses current directly. */
-#define CUR_LIMIT_MA 2000U /* 2.0 A soft limit */
+ * The translator cuts the FET only when the draw stays at/above CUR_LIMIT_MA
+ * continuously for OC_DEBOUNCE_MS -- a debounce so a motor-ramp transient
+ * doesn't nuisance-trip (the LM51772 handles fast limiting itself; this FET is
+ * the sustained-fault backstop, e.g. a dying pack). The latch holds until the
+ * pack is removed (re-arm). The translator never senses current directly. */
+#define CUR_LIMIT_MA  2000U /* 2.0 A soft limit (5 A in the product)      */
+#define OC_DEBOUNCE_MS 1000U /* draw must exceed the limit this long to cut */
 
 /* Latest values, exposed (volatile, non-static) so they survive -Og and can
  * be watched over SWD. */
@@ -69,6 +73,7 @@ volatile uint16_t g_cell_mv   = 0;   /* per-cell voltage, millivolts */
 volatile uint8_t  g_fet_on    = 0;   /* Power FET state driven on PA1 */
 volatile uint16_t g_current_ma = 0;  /* current reported by the sim (mA) */
 volatile uint8_t  g_oc_fault  = 0;   /* 1 = over-current cutoff latched */
+volatile uint8_t  g_oc_active = 0;   /* 1 = over the limit, debounce running */
 
 /* -------- microsecond delays via the DWT cycle counter -------- */
 static void dwt_init(void)
@@ -209,10 +214,21 @@ int main(void)
         }
         g_current_ma = cur_ma;
 
+        /* Debounced over-current: latch the cutoff only after the draw has been
+         * at/above the limit continuously for OC_DEBOUNCE_MS. Any dip below the
+         * limit (or a dropped pack) resets the timer. Wall-clock via DWT, so the
+         * window is independent of the loop rate. */
+        static uint32_t oc_since = 0;    /* DWT stamp when the draw went over */
         if (!(flags & PR_FLAG_VALID)) {
-            g_oc_fault = 0;               /* pack removed -> re-arm */
+            g_oc_fault  = 0;             /* pack removed -> re-arm */
+            g_oc_active = 0;
         } else if (cvalid && cur_ma >= CUR_LIMIT_MA) {
-            g_oc_fault = 1;               /* soft fail: latch the FET off */
+            if (!g_oc_active) { g_oc_active = 1; oc_since = DWT->CYCCNT; }
+            else if ((DWT->CYCCNT - oc_since) / (SystemCoreClock / 1000U) >= OC_DEBOUNCE_MS) {
+                g_oc_fault = 1;          /* sustained over-current -> soft fail */
+            }
+        } else {
+            g_oc_active = 0;             /* dropped below the limit -> reset */
         }
 
         /* 5. Final FET state: sag-permitted AND not over-current. */
