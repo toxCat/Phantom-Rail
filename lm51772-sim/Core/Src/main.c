@@ -55,6 +55,8 @@
 #define ACS_ADC_MAX        4095U
 #define ACS_ZERO_MV        2494U   /* measured VIOUT at 0 A on this rig (~VCC/2) */
 #define ACS_SENS_MV_PER_A  28U     /* -35BB @ ~5V; 1 ADC count ~= 29 mA of I */
+#define ACS_OVERSAMPLE     8U      /* conversions averaged per sample (noise)  */
+#define CUR_SAMPLE_MS      500U    /* re-sample the current at 2 Hz, hold between */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -116,17 +118,37 @@ static void acs_init(void)
     lcd_delay_ms(1);                        /* tSTAB */
 }
 
-/* One conversion -> current in milliamps. *valid=0 on ADC timeout. */
-static uint16_t acs_read_ma(uint8_t *valid)
+/* One conversion with a CLEAN start: clear ADC_SR first so we always wait for
+ * THIS conversion's EOC, never a stale flag left set (which would make the wait
+ * fall straight through and read garbage/0 -- the source of the 0/value flicker).
+ * *ok = 0 on timeout. */
+static uint16_t acs_convert(uint8_t *ok)
 {
+    ADC1->SR = 0;                          /* clear EOC/OVR/STRT before starting */
     ADC1->CR2 |= ADC_CR2_SWSTART;
     uint32_t start = DWT->CYCCNT;
     uint32_t ticks = 2000U * (SystemCoreClock / 1000000U);   /* 2 ms budget */
     while (!(ADC1->SR & ADC_SR_EOC)) {
-        if ((DWT->CYCCNT - start) > ticks) { *valid = 0; return 0; }
+        if ((DWT->CYCCNT - start) > ticks) { *ok = 0; return 0; }
     }
-    uint16_t raw  = (uint16_t)ADC1->DR;
-    uint32_t v_mv = (uint32_t)raw * ACS_VREF_MV / ACS_ADC_MAX;
+    *ok = 1;
+    return (uint16_t)ADC1->DR;             /* reading DR clears EOC */
+}
+
+/* Averaged current read -> milliamps. *valid = 0 only if every conversion in
+ * the burst timed out (caller then holds its last good reading). */
+static uint16_t acs_read_ma(uint8_t *valid)
+{
+    uint32_t sum = 0, good = 0;
+    for (uint32_t i = 0; i < ACS_OVERSAMPLE; i++) {
+        uint8_t ok;
+        uint16_t r = acs_convert(&ok);
+        if (ok) { sum += r; good++; }
+    }
+    if (good == 0) { *valid = 0; return 0; }
+
+    uint32_t raw  = sum / good;
+    uint32_t v_mv = raw * ACS_VREF_MV / ACS_ADC_MAX;
     int32_t  dv   = (int32_t)v_mv - (int32_t)ACS_ZERO_MV;    /* signed offset */
     if (dv < 0) dv = 0;                                       /* unidirectional load */
     uint32_t ma   = (uint32_t)dv * 1000U / ACS_SENS_MV_PER_A;
@@ -336,12 +358,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* Task 3: sample the ACS709 and publish it for the translator to READ back
+    /* Task 3: sample the ACS709 at CUR_SAMPLE_MS (2 Hz) and HOLD the last good
+     * reading between samples, so the printed amperage is steady and a single
+     * bad conversion can't blank it. Publish it for the translator to READ back
      * (it makes the 2 A cutoff decision; we never gate our own FET). */
-    uint8_t  cvalid = 0;
-    uint16_t cur_ma = acs_read_ma(&cvalid);
+    static uint32_t cur_stamp  = 0;
+    static uint16_t cur_ma     = 0;
+    static uint8_t  cur_primed = 0;
+    if (!cur_primed ||
+        (DWT->CYCCNT - cur_stamp) / (SystemCoreClock / 1000U) >= CUR_SAMPLE_MS) {
+        uint8_t ok;
+        uint16_t m = acs_read_ma(&ok);
+        if (ok) { cur_ma = m; cur_primed = 1; }   /* hold last good on failure */
+        cur_stamp = DWT->CYCCNT;
+    }
     g_cur_ma = cur_ma;
-    i2c1_slave_set_current(cur_ma, cvalid ? PR_CFLAG_VALID : 0U);
+    i2c1_slave_set_current(cur_ma, cur_primed ? PR_CFLAG_VALID : 0U);
 
     /* Latest source telemetry from the translator over I2C1. */
     uint16_t in_mv;

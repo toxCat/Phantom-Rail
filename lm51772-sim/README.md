@@ -31,7 +31,10 @@ Register-level CMSIS (HAL generated but unused). Builds independently:
 - **Current sense** (`acs_read_ma` in `main.c`) — register-level ADC on PA0
   reads the ACS709 VIOUT, converts to mA (tunable `ACS_ZERO_MV` /
   `ACS_SENS_MV_PER_A`), publishes it to the slave for the translator to read,
-  and shows it on row1 as `…V X.XXA`. Exposed via `g_cur_ma` for SWD.
+  and shows it on row1 as `…V X.XXA`. Exposed via `g_cur_ma` for SWD. Each
+  conversion does a clean start (clears `ADC_SR` so a stale `EOC` can't be read
+  as 0); samples are oversampled (`ACS_OVERSAMPLE`) and taken at 2 Hz
+  (`CUR_SAMPLE_MS`) with last-good hold, so the reading is steady.
 - **Display** — row0 (IN) shows the received source plus the translator's sag
   warning: `IN:6S 22.75V` charged, `…V LOW` in the 3.2-3.6 V/cell band, or
   `…(x_X)` below 3.2 V/cell. Row1 (OUT) shows the stubbed setpoint plus the live
