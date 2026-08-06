@@ -23,6 +23,11 @@ int i2c1_master_write(uint8_t addr7, const uint8_t *data, uint32_t len);
  * receiver ACK/STOP dance so the final byte is NACKed correctly. */
 int i2c1_master_read(uint8_t addr7, uint8_t *buf, uint32_t len);
 
+/* Register read: write the register pointer, repeated-START, then read len
+ * bytes (auto-increment). Returns 1 on success, 0 on NACK / timeout. A plain
+ * register WRITE is just i2c1_master_write(addr, {reg, d0, d1, ...}, 1+n). */
+int i2c1_master_read_reg(uint8_t addr7, uint8_t reg, uint8_t *buf, uint32_t len);
+
 /* Reset the I2C1 peripheral to clear a wedged/stuck-BUSY state. Call after a
  * failed write so the master self-heals (e.g. once the slave finishes booting)
  * instead of needing a manual reset. */

@@ -1,7 +1,10 @@
-# Translator — Black Pill #1 (I2C1 master)
+# Translator — Black Pill #1 (I2C1 host / master)
 
-FC-facing board. Reads the source voltage, talks MSP to the flight controller,
-and drives the LM51772 sim board (`../lm51772-sim`) as **I2C1 master**.
+FC-facing board and the **host controller** for the LM51772 sim
+(`../lm51772-sim`): it reads the source voltage, runs pack detection + the sag
+monitor, drives the Power FET, and controls the sim exactly as a flight
+controller would drive a real LM51772 — writing its control registers and
+reading status over **I2C1** (`../Protocol/lm51772_regs.h`, addr 0x6A).
 
 Register-level CMSIS, no HAL. Builds independently: `make` → `build/translator.{elf,hex,bin}`.
 
@@ -24,32 +27,26 @@ Implemented:
   a `volatile` global you can watch over SWD.
 - **Pack detection** — LiPo cell count via the Betaflight convention (smallest
   S whose 4.3 V/cell ceiling covers the reading), in `g_cells`.
-- **I2C1 master** (`Core/Src/i2c1_master.c`) — register-level, standard-mode
-  100 kHz on PB6/PB7. Each ~250 ms it builds a telemetry frame
-  (`../Protocol/phantom_link.h`) and writes it to the sim at `0x42`;
-  `g_link_ok` reflects whether the last push was ACKed. On a failed push it
-  calls `i2c1_master_recover()` (SWRST) so a stuck-BUSY from start-up NACKs
-  self-heals — no manual reset needed when the sim boots later than the
-  translator.
-- **Power FET + sag monitor** (Task 1 + 2) — N-channel gate on **PA1**,
-  active-high, starts low (fail-safe). The cell count is **latched at plug-in**
-  (so a sagging pack isn't re-counted as fewer cells and mask the sag), and
-  per-cell voltage against that count picks one of three bands:
-  | per-cell        | band     | FET | sim shows          |
-  |-----------------|----------|-----|--------------------|
-  | 3.6 – 4.2 V     | charged  | ON  | `IN:6S 22.75V`     |
-  | 3.2 – 3.6 V     | low/sag  | ON  | `…V LOW`           |
-  | < 3.2 V         | critical | OFF | `…(x_X)`           |
-  The band is sent to the sim in the frame flags; `g_fet_on` / `g_cell_mv`
-  expose state over SWD.
-- **Over-current soft-fail** (Task 3) — each loop the master **reads** the
-  sim's ACS709 current back over I2C1 (`i2c1_master_read`). The cutoff is
-  **debounced**: the draw must stay ≥ **2 A** (`CUR_LIMIT_MA`) continuously for
-  `OC_DEBOUNCE_MS` (1 s) before the FET latches off, so a motor-ramp transient
-  doesn't nuisance-trip — the FET is the sustained-fault backstop, not a fast
-  limiter (the LM51772 handles that). The latch clears when the pack is removed
-  (re-arm). The translator never senses current directly. `g_current_ma` /
-  `g_oc_active` / `g_oc_fault` expose state over SWD.
+- **LM51772 host** (`Core/Src/i2c1_master.c`) — register-addressed I2C1 master,
+  100 kHz on PB6/PB7. Each ~100 ms cycle it writes the sim's registers:
+  **VOUT_TARGET** (0x0C/0x0D, `VOUT_CMD_MV` = 12 V default, ×20 mV code),
+  **ILIM_THRESHOLD** (0x0A, `CUR_LIMIT_MA` = 2 A), **CONV_EN2** (0x81, from the
+  sag/enable logic), plus the battery view into extension registers 0xE0–0xE3;
+  then it reads **USB_PD_STATUS_0** (0x21). `i2c1_master_read_reg()` does the
+  write-pointer + repeated-start read. On a failed transfer it calls
+  `i2c1_master_recover()` (SWRST) so a start-up NACK self-heals.
+- **Power FET + sag monitor** — N-channel gate on **PA1**, active-high, starts
+  low (fail-safe). Cell count is **latched at plug-in** (so a sagging pack isn't
+  re-counted as fewer cells). Per-cell bands: `≥3.6 V` charged → CONV_EN2 + FET
+  on; `3.2–3.6 V` LOW warning, still on; `<3.2 V` critical → disable. Battery
+  state drives the sim's IN row via the extension registers. `g_fet_on` /
+  `g_cell_mv` over SWD.
+- **Over-current soft-fail (via the IC model)** — the sim compares its ACS709
+  reading to the ILIM the host programmed and raises **CC_OPERATION**. The host
+  reads it back and, when it stays set ≥ **`OC_DEBOUNCE_MS`** (1 s), latches the
+  FET off — the sustained-fault backstop (the LM51772 does fast limiting
+  itself). On pack removal it re-arms and writes **CLEAR_FAULTS** (0x03) to the
+  sim. `g_oc_active` / `g_oc_fault` / `g_pd_status` over SWD.
 - **PC13 heartbeat**.
 
 Bench check: a 22.94 V 6S pack read 2.528 V at PA0 → 22.75 V computed → `6S`
@@ -60,5 +57,5 @@ values if you want it exact.
 The link needs external pull-ups on SDA/SCL and a common ground — see the root
 README.
 
-TODO: USART1/MSP polling, the enable/disable GPIO, UVLO (hysteresis +
-debounce), and the static-selector truth table.
+TODO (next phase): USART1/MSP link to the FC (pass-through for the EdgeTX GVAR
+table) so the transmitter can command VOUT_TARGET and toggle CONV_EN2 remotely.

@@ -24,8 +24,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lcd1602.h"
-#include "i2c1_slave.h"    /* inter-board I2C1 link (PB6/PB7) */
-#include "phantom_link.h"  /* shared wire format (../Protocol) */
+#include "i2c1_slave.h"    /* LM51772 register slave on I2C1 (PB6/PB7) */
+#include "lm51772_regs.h"  /* shared register map (../Protocol) */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,14 +35,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* Bench bring-up aid: when set, row1 shows the I2C1 link counters
- * "A<addr-hits> F<frames> x<flags>" instead of the stubbed OUT, and row0 shows
- * the received value as soon as ANY frame parses (ignoring the valid flag).
- * Left at 0 in normal operation (row1 = OUT substitute). */
-#define LINK_DEBUG 0
-
-/* Sag-warning text appended to the IN row, decided by the translator and sent
- * in the frame flags (PR_FLAG_LOW / PR_FLAG_CRIT). */
+/* Sag-warning text appended to the IN row, from the battery flags the host
+ * writes into the extension registers (PR_BATT_LOW / PR_BATT_CRIT). */
 #define WARN_NONE 0   /* charged: no text            */
 #define WARN_LOW  1   /* 3.2-3.6 V/cell: "LOW"       */
 #define WARN_CRIT 2   /* < 3.2 V/cell: "(x_X)"       */
@@ -80,25 +74,23 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN 0 */
 
 /*
- * LM51772 Sim -- LCD bring-up demo (second black pill).
+ * LM51772 Sim (second black pill).
  *
- * Purpose: render the source telemetry that the translator (first black pill)
- * pushes over the I2C1 link, and stand in for the LM51772 output. The IN row
- * now shows the REAL source: the translator reads the pack behind its /9
- * divider, detects the cell count, and writes a frame to us (I2C1 slave,
- * address PR_I2C_ADDR). OUT is still a stubbed LM51772 setpoint.
+ * Presents the real LM51772 I2C register interface (I2C1 slave @ LM_ADDR, see
+ * ../Protocol/lm51772_regs.h) to the translator, which acts as the host
+ * controller. The host writes VOUT_TARGET / ILIM_THRESHOLD / CONV_EN2 and reads
+ * status back, exactly as a flight controller would drive the real IC. This
+ * board also reads the ACS709 (PA0) as the IC's output current and models the
+ * status bits (CC_OPERATION / IOUT_OC vs the programmed ILIM).
  *
- * Screen flow:
- *   1. splash "LM51772 Sim"
- *   2. clear
- *   3. row0: "IN:nS XX.XXV"     (n = cell count from the translator;
- *                                "--" until a valid frame arrives)
- *      row1: "OUT:XX.XXV"
+ * Screen (16x2):
+ *   row0: "IN:nS XX.XXV [warn]"   battery view (from extension regs 0xE0-0xE3)
+ *   row1: "XX.XXV X.XXA STS"      commanded VOUT, measured current, status
+ *                                 (ON / CC / OC / OFF)
  *
- * The LCD itself is driven by the register-level (CMSIS, no HAL) hardware-I2C2
- * driver in Src/lcd1602.c. It owns the I2C2 peripheral (PB10/PB3), so the
- * generated HAL I2C init is deliberately left uncalled (see MX_I2C*_Init note
- * below).
+ * The LCD is driven by the register-level hardware-I2C2 driver in Src/lcd1602.c
+ * (PB10/PB3), separate from the I2C1 host link, so the generated HAL I2C init
+ * is deliberately left uncalled.
  */
 
 /* -------- ACS709 current sense on PA0 (ADC1_IN0), Task 3 --------
@@ -208,59 +200,30 @@ static void draw_in_stale(void)
     lcd_print("IN:--S --.--V   ");
 }
 
-#if LINK_DEBUG
-/* Write v as decimal into d (max 5 digits); return the number of chars. */
-static int put_u16(char *d, uint16_t v)
-{
-    char tmp[5];
-    int  i = 0;
-    if (v == 0) { d[0] = '0'; return 1; }
-    while (v && i < 5) { tmp[i++] = (char)('0' + v % 10U); v /= 10U; }
-    for (int j = 0; j < i; j++) d[j] = tmp[i - 1 - j];
-    return i;
-}
-static char hex_nib(uint8_t nib) { return (char)(nib < 10 ? '0' + nib : 'A' + nib - 10); }
-
-/* Row1 diagnostic: "A<hits> F<frames> x<flags>" (counters capped at 9999). */
-static void draw_diag(uint32_t hits, uint32_t frames, uint8_t flags)
-{
-    char line[17];
-    int  n = 0;
-    line[n++] = 'A';
-    n += put_u16(line + n, (uint16_t)(hits   > 9999U ? 9999U : hits));
-    line[n++] = ' ';
-    line[n++] = 'F';
-    n += put_u16(line + n, (uint16_t)(frames > 9999U ? 9999U : frames));
-    line[n++] = ' ';
-    line[n++] = 'x';
-    line[n++] = hex_nib((uint8_t)(flags >> 4));
-    line[n++] = hex_nib((uint8_t)(flags & 0x0F));
-    while (n < 16) line[n++] = ' ';
-    line[16] = '\0';
-    lcd_set_cursor(0, 1);
-    lcd_print(line);
-}
-#endif /* LINK_DEBUG */
-
-/* Row1 (OUT): substitute output voltage, then the measured current to the
- * right as "X.XXA" (Task 3). e.g. "OUT:12.00V 1.85A". */
-__attribute__((unused)) static void draw_out(uint32_t mv, uint16_t cur_ma)
+/* Row1 (OUTPUT side of the LM51772 model): commanded output voltage from
+ * VOUT_TARGET, the measured current, and a status field:
+ *   "12.00V 1.85A ON "   enabled & regulating
+ *   "12.00V 2.05A CC "   in current-limit (ACS709 >= ILIM)
+ *   "12.00V 2.05A OC "   over-current fault latched
+ *   "12.00V 0.00A OFF"   converter disabled (CONV_EN2 = 0)                    */
+static void draw_out(uint32_t mv, uint16_t cur_ma, const char *status)
 {
     char v[6], line[17];
     fmt_volts(v, mv);
-    line[0] = 'O'; line[1] = 'U'; line[2] = 'T'; line[3] = ':';
-    for (int i = 0; i < 5; i++) line[4 + i] = v[i];   /* "XX.XX" -> cols 4..8 */
-    line[9] = 'V';
+    for (int i = 0; i < 5; i++) line[i] = v[i];       /* "XX.XX" -> cols 0..4 */
+    line[5] = 'V';
+    line[6] = ' ';
 
     uint32_t aw = cur_ma / 1000U;             /* whole amps */
     uint32_t ac = (cur_ma % 1000U) / 10U;     /* centi-amps (2 digits) */
     if (aw > 9U) { aw = 9U; ac = 99U; }       /* single-digit field caps at 9.99 */
-    line[10] = ' ';
-    line[11] = (char)('0' + aw);
-    line[12] = '.';
-    line[13] = (char)('0' + ac / 10U);
-    line[14] = (char)('0' + ac % 10U);
-    line[15] = 'A';
+    line[7]  = (char)('0' + aw);
+    line[8]  = '.';
+    line[9]  = (char)('0' + ac / 10U);
+    line[10] = (char)('0' + ac % 10U);
+    line[11] = 'A';
+    line[12] = ' ';
+    line[13] = status[0]; line[14] = status[1]; line[15] = status[2];
     line[16] = '\0';
     lcd_set_cursor(0, 1);
     lcd_print(line);
@@ -337,10 +300,10 @@ int main(void)
    * Returns the address that ACKed, or 0 if the bus is silent. */
   uint8_t lcd_addr = lcd_init();
 
-  /* Bring up the I2C1 slave link regardless of the LCD: the translator can
-   * start pushing frames the moment we ACK our address. */
-  i2c1_slave_init(PR_I2C_ADDR);
-  acs_init();                    /* ACS709 current sense on PA0 (Task 3) */
+  /* Bring up the LM51772 register slave (I2C1 @ LM_ADDR) regardless of the LCD:
+   * the host controller can read/write our registers the moment we ACK. */
+  i2c1_slave_init(LM_ADDR);
+  acs_init();                    /* ACS709 current sense on PA0 (Iout) */
 
   if (lcd_addr) {
     /* 1-2: splash, then clear */
@@ -358,10 +321,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    /* Task 3: sample the ACS709 at CUR_SAMPLE_MS (2 Hz) and HOLD the last good
-     * reading between samples, so the printed amperage is steady and a single
-     * bad conversion can't blank it. Publish it for the translator to READ back
-     * (it makes the 2 A cutoff decision; we never gate our own FET). */
+    /* 1. Measure output current (ACS709) at CUR_SAMPLE_MS (2 Hz) with last-good
+     *    hold, so the reading is steady. This is the LM51772's internal Iout. */
     static uint32_t cur_stamp  = 0;
     static uint16_t cur_ma     = 0;
     static uint8_t  cur_primed = 0;
@@ -369,53 +330,55 @@ int main(void)
         (DWT->CYCCNT - cur_stamp) / (SystemCoreClock / 1000U) >= CUR_SAMPLE_MS) {
         uint8_t ok;
         uint16_t m = acs_read_ma(&ok);
-        if (ok) { cur_ma = m; cur_primed = 1; }   /* hold last good on failure */
+        if (ok) { cur_ma = m; cur_primed = 1; }
         cur_stamp = DWT->CYCCNT;
     }
     g_cur_ma = cur_ma;
-    i2c1_slave_set_current(cur_ma, cur_primed ? PR_CFLAG_VALID : 0U);
 
-    /* Latest source telemetry from the translator over I2C1. */
-    uint16_t in_mv;
-    uint8_t  cells, flags;
-    i2c1_slave_get(&in_mv, &cells, &flags);
-    uint32_t age = i2c1_slave_age_ms();       /* 0xFFFFFFFF until a frame parses */
+    /* 2. Decode the host-written control registers. */
+    uint8_t  ctrl   = lm_reg_get(LM_REG_PD_CONTROL0);
+    uint8_t  enable = (ctrl & LM_CONV_EN2) ? 1U : 0U;
+    uint8_t  div20  = (lm_reg_get(LM_REG_MFR_D8) & LM_SEL_FB_DIV20) ? 1U : 0U;
+    uint16_t vcode  = lm_vout_code(lm_reg_get(LM_REG_VOUT_LSB), lm_reg_get(LM_REG_VOUT_MSB));
+    uint16_t vout_mv = lm_vout_to_mv(vcode, div20);
+    uint16_t ilim_ma = lm_ilim_to_ma(lm_reg_get(LM_REG_ILIM));
 
-    /* Map the translator's sag flags to the warning appended on the IN row. */
-    uint8_t warn = WARN_NONE;
-    if (flags & PR_FLAG_CRIT)     warn = WARN_CRIT;
-    else if (flags & PR_FLAG_LOW) warn = WARN_LOW;
+    /* 3. Model status. CC when enabled and the measured current is at/above the
+     *    programmed ILIM; IOUT_OC latches until CLEAR_FAULTS. VIN_UV mirrors the
+     *    host's battery-critical flag (extension register). */
+    static uint8_t oc_latched = 0;
+    if (lm_take_clear_faults()) oc_latched = 0;
+    uint8_t cc = (enable && cur_ma >= ilim_ma) ? 1U : 0U;
+    if (cc) oc_latched = 1;
 
-#if LINK_DEBUG
-    /* Bring-up view: row0 = received value the moment any frame parses (ignore
-     * the valid flag), row1 = link counters. Read row1 to localize a failure:
-     *   A0  F0   -> master never reached us (wiring / master / addressing)
-     *   A>0 F0   -> addressed, but bytes/parse failed (framing)
-     *   A>0 F>0  -> link works; if row0 reads 00.00V the ADC is the problem */
+    uint8_t batt = lm_reg_get(PR_EXT_BATT);
+    uint8_t status = 0;
+    if (!enable)              status |= LM_ST_OFF;
+    if (oc_latched)           status |= LM_ST_IOUT_OC;
+    if (batt & PR_BATT_CRIT)  status |= LM_ST_VIN_UV;
+    lm_reg_set(LM_REG_STATUS_BYTE, status);
+    lm_reg_set(LM_REG_PD_STATUS0, cc ? LM_CC_OPERATION : 0U);
+
+    /* 4. Display. Row0 = battery IN (from the host's extension registers) with
+     *    the sag warning; row1 = LM51772 output view. */
     if (lcd_addr) {
-      if (age != 0xFFFFFFFFU) draw_in(cells, in_mv, warn);
-      else                    draw_in_stale();
-      uint32_t hits, frames;
-      i2c1_slave_diag(&hits, &frames);
-      draw_diag(hits, frames, flags);
-    }
-    int live = (age < 1500U);
-#else
-    /* Normal view: trust the reading only if flagged valid AND recent. Row0 =
-     * IN + sag warning; row1 = OUT (substitute until FC control lands). */
-    int live = (flags & PR_FLAG_VALID) && (age < 1500U);
-    if (lcd_addr) {
-      if (live) draw_in(cells, in_mv, warn);
-      else      draw_in_stale();
-      draw_out(12000U, cur_ma);   /* OUT: stub setpoint (12.00 V) + measured A */
-    }
-#endif
+      if (batt & PR_BATT_VALID) {
+        uint16_t vin_mv = (uint16_t)(lm_reg_get(PR_EXT_VIN_LSB) |
+                                     ((uint16_t)lm_reg_get(PR_EXT_VIN_MSB) << 8));
+        uint8_t  cells  = lm_reg_get(PR_EXT_CELLS);
+        uint8_t  warn   = (batt & PR_BATT_CRIT) ? WARN_CRIT
+                        : (batt & PR_BATT_LOW)  ? WARN_LOW : WARN_NONE;
+        draw_in(cells, vin_mv, warn);
+      } else {
+        draw_in_stale();
+      }
 
-    /* Heartbeat encodes link state without needing the LCD:
-     *   ~2 Hz  = live source frames arriving
-     *   ~3 Hz  = running but no live source / link idle */
+      const char *st = !enable ? "OFF" : oc_latched ? "OC " : cc ? "CC " : "ON ";
+      draw_out(vout_mv, cur_ma, st);
+    }
+
     led_toggle();
-    lcd_delay_ms(live ? 250U : 150U);
+    lcd_delay_ms(200U);
   }
   /* USER CODE END 3 */
 }

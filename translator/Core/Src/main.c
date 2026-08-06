@@ -1,24 +1,22 @@
-#include "stm32f4xx.h"   /* CMSIS device header; SystemInit() runs from startup */
-#include "i2c1_master.h"  /* inter-board I2C1 link (PB6/PB7) */
-#include "phantom_link.h" /* shared wire format (../Protocol) */
+#include "stm32f4xx.h"    /* CMSIS device header; SystemInit() runs from startup */
+#include "i2c1_master.h"  /* register-addressed I2C1 master (PB6/PB7) */
+#include "lm51772_regs.h" /* shared LM51772 register map (../Protocol) */
 
 /*
- * Phantom-Rail -- Translator (Black Pill #1): the I2C1 MASTER.
+ * Phantom-Rail -- Translator (Black Pill #1): the I2C1 MASTER / host controller.
  *
  * Role in the rig:
  *   - Reads the source/battery voltage on PA0 (ADC1_IN0) behind a 120k/15k
- *     divider (/9, ~29 V full scale) -- the "VREF" the sim board displays.
- *   - Talks to the flight controller over USART1 (PA9/PA10, MSP).
- *   - Drives the LM51772 sim board (Black Pill #2) as I2C1 MASTER on PB6/PB7,
- *     and gates it via an enable/disable GPIO.
+ *     divider (/9), detects the pack, and runs the sag monitor.
+ *   - Drives the N-channel Power FET (PA1) as the physical power-path switch.
+ *   - Acts as the host for the LM51772 sim (Black Pill #2): writes its control
+ *     registers (VOUT_TARGET, ILIM_THRESHOLD, CONV_EN2) and reads status --
+ *     exactly as a flight controller would drive the real IC. The battery view
+ *     is passed to the sim's display via Phantom-Rail extension registers.
+ *   - Over-current soft-fail: sets ILIM on the sim, reads back CC_OPERATION,
+ *     debounces, and cuts the FET.
  *
- * Status: SKELETON. This pass brings up the ADC source-sense reader and a
- * PC13 liveness heartbeat so the board is testable on the bench. Still TODO:
- * USART1/MSP link to the FC, the I2C1 master transfer that pushes the reading
- * to the slave, UVLO/hysteresis, and the static-selector truth table.
- *
- * Conventions (see PROJECT.md): register-level CMSIS, no HAL; delays derive
- * from SystemCoreClock; default HSI (16 MHz) is fine.
+ * Conventions: register-level CMSIS, no HAL; delays derive from SystemCoreClock.
  */
 
 /* ---- Source-sense scaling ----
@@ -52,15 +50,20 @@
 #define CELL_LOW_MV  3600U /* 3.2-3.6: sag warning, FET stays on            */
 #define CELL_HI_MV   4200U /* 3.6-4.2: charged; above: over-voltage guard   */
 
-/* ---- Over-current soft-fail (Task 3) ----
- * The sim reads the ACS709 on the Vsw/ESC line and reports current over I2C1.
- * The translator cuts the FET only when the draw stays at/above CUR_LIMIT_MA
- * continuously for OC_DEBOUNCE_MS -- a debounce so a motor-ramp transient
- * doesn't nuisance-trip (the LM51772 handles fast limiting itself; this FET is
- * the sustained-fault backstop, e.g. a dying pack). The latch holds until the
- * pack is removed (re-arm). The translator never senses current directly. */
+/* ---- Over-current soft-fail (via the LM51772 model) ----
+ * The host writes ILIM_THRESHOLD (CUR_LIMIT_MA) to the sim; the sim compares
+ * its ACS709 reading to that limit and raises CC_OPERATION / IOUT_OC. The host
+ * reads CC_OPERATION back and cuts the FET only when it stays set continuously
+ * for OC_DEBOUNCE_MS (a motor-ramp transient must not nuisance-trip; the LM51772
+ * handles fast limiting itself -- this FET is the sustained-fault backstop). The
+ * latch holds until the pack is removed (re-arm), which also clears the sim's
+ * faults. The translator never senses current directly. */
 #define CUR_LIMIT_MA  2000U /* 2.0 A soft limit (5 A in the product)      */
-#define OC_DEBOUNCE_MS 1000U /* draw must exceed the limit this long to cut */
+#define OC_DEBOUNCE_MS 1000U /* CC must persist this long to cut          */
+
+/* Commanded LM51772 output voltage (host -> VOUT_TARGET). Fixed for now; the FC
+ * and transmitter script will drive this in the next tasks. */
+#define VOUT_CMD_MV   12000U
 
 /* Latest values, exposed (volatile, non-static) so they survive -Og and can
  * be watched over SWD. */
@@ -71,9 +74,9 @@ volatile uint16_t g_adc_raw   = 0;   /* last raw ADC count (0..4095) */
 volatile uint8_t  g_adc_ok    = 0;   /* 1 = last conversion completed */
 volatile uint16_t g_cell_mv   = 0;   /* per-cell voltage, millivolts */
 volatile uint8_t  g_fet_on    = 0;   /* Power FET state driven on PA1 */
-volatile uint16_t g_current_ma = 0;  /* current reported by the sim (mA) */
 volatile uint8_t  g_oc_fault  = 0;   /* 1 = over-current cutoff latched */
-volatile uint8_t  g_oc_active = 0;   /* 1 = over the limit, debounce running */
+volatile uint8_t  g_oc_active = 0;   /* 1 = CC asserted, debounce running */
+volatile uint8_t  g_pd_status = 0;   /* last USB_PD_STATUS_0 read from sim */
 
 /* -------- microsecond delays via the DWT cycle counter -------- */
 static void dwt_init(void)
@@ -167,89 +170,79 @@ int main(void)
         uint32_t src_mv = mv_pin * VDIV_NUM / VDIV_DEN;
         g_source_mv     = src_mv;
 
-        /* 2. Detect the pack, latching the cell count at plug-in. Re-detecting
-         *    every loop would mis-count a sagging pack as fewer cells and mask
-         *    the sag; g_cells holds the count until the pack is removed. */
-        uint8_t flags = 0;
+        /* 2. Detect the pack, latching the cell count at plug-in. */
+        uint8_t batt = 0;
         if (src_mv >= SRC_MIN_MV) {
             if (g_cells == 0) g_cells = (uint8_t)(src_mv / CELL_MAX_MV) + 1U;
-            flags |= PR_FLAG_VALID;
+            batt |= PR_BATT_VALID;
         } else {
             g_cells = 0;                  /* disconnected -> re-detect next pack */
         }
         uint8_t cells = g_cells;
 
-        /* 3. Sag monitor -> base FET decision (Task 2). Per-cell voltage
-         *    against the latched count sorts into charged / low / critical;
-         *    the FET is permitted through LOW and cut below the critical floor. */
+        /* 3. Sag monitor -> enable command + battery flags. Enable the converter
+         *    through the LOW band; disable it below the critical floor. */
         uint16_t per_cell = (cells > 0) ? (uint16_t)(src_mv / cells) : 0U;
         g_cell_mv = per_cell;
 
-        uint8_t base_fet = 0;
-        if (flags & PR_FLAG_VALID) {
-            if (per_cell < CELL_CRIT_MV) {
-                flags |= PR_FLAG_CRIT;    /* < 3.2 V: critical -> FET off */
-            } else if (per_cell < CELL_LOW_MV) {
-                flags |= PR_FLAG_LOW;     /* 3.2-3.6 V: sag warning       */
-                base_fet = 1;
-            } else if (per_cell <= CELL_HI_MV) {
-                base_fet = 1;             /* 3.6-4.2 V: charged           */
-            }
-            /* > 4.2 V (over-voltage / bad reading): leave FET off, no warning */
+        uint8_t enable = 0;
+        if (batt & PR_BATT_VALID) {
+            if (per_cell < CELL_CRIT_MV)      batt |= PR_BATT_CRIT;      /* disable */
+            else if (per_cell < CELL_LOW_MV) { batt |= PR_BATT_LOW; enable = 1; }
+            else if (per_cell <= CELL_HI_MV)   enable = 1;
         }
 
-        /* 4. Read the sim's ACS709 current over I2C1 and latch the over-current
-         *    soft-fail (Task 3). The latch clears only when the pack is removed. */
-        uint8_t  cf[PR_CUR_FRAME_LEN];
-        uint16_t cur_ma = 0;
-        uint8_t  cvalid = 0;
-        if (i2c1_master_read(PR_I2C_ADDR, cf, PR_CUR_FRAME_LEN)) {
-            uint16_t ima; uint8_t cflags;
-            if (pr_parse_current(cf, PR_CUR_FRAME_LEN, &ima, &cflags)) {
-                cur_ma = ima;
-                cvalid = (uint8_t)(cflags & PR_CFLAG_VALID);
-            }
-        } else {
-            i2c1_master_recover();
-        }
-        g_current_ma = cur_ma;
+        /* 4. Drive the LM51772 registers on the sim (host writes). */
+        uint16_t vin16 = (src_mv > 65535U) ? 65535U : (uint16_t)src_mv;
+        uint16_t vcode = lm_vout_from_mv(VOUT_CMD_MV, 1);  /* div20=1 (reset) */
+        int ok = 1;
+        /* 4a. Battery view for the sim's display (extension registers). */
+        uint8_t ext[5] = { PR_EXT_VIN_LSB, (uint8_t)vin16, (uint8_t)(vin16 >> 8),
+                           cells, batt };
+        ok &= i2c1_master_write(LM_ADDR, ext, 5);
+        /* 4b. Current limit. */
+        uint8_t ilim[2] = { LM_REG_ILIM, lm_ilim_from_ma(CUR_LIMIT_MA) };
+        ok &= i2c1_master_write(LM_ADDR, ilim, 2);
+        /* 4c. Output voltage target (LSB then MSB, auto-increment). */
+        uint8_t vt[3] = { LM_REG_VOUT_LSB, (uint8_t)(vcode & 0xFFu),
+                          (uint8_t)((vcode >> 8) & 0x0Fu) };
+        ok &= i2c1_master_write(LM_ADDR, vt, 3);
+        /* 4d. Enable the power stage (CONV_EN2). */
+        uint8_t en[2] = { LM_REG_PD_CONTROL0, (uint8_t)(enable ? LM_CONV_EN2 : 0U) };
+        ok &= i2c1_master_write(LM_ADDR, en, 2);
+        g_link_ok = (uint8_t)ok;
+        if (!ok) i2c1_master_recover();   /* self-heal a stuck/booting link */
 
-        /* Debounced over-current: latch the cutoff only after the draw has been
-         * at/above the limit continuously for OC_DEBOUNCE_MS. Any dip below the
-         * limit (or a dropped pack) resets the timer. Wall-clock via DWT, so the
-         * window is independent of the loop rate. */
-        static uint32_t oc_since = 0;    /* DWT stamp when the draw went over */
-        if (!(flags & PR_FLAG_VALID)) {
-            g_oc_fault  = 0;             /* pack removed -> re-arm */
-            g_oc_active = 0;
-        } else if (cvalid && cur_ma >= CUR_LIMIT_MA) {
+        /* 5. Read CC_OPERATION back and debounce the over-current cutoff. */
+        uint8_t pd0 = 0;
+        if (i2c1_master_read_reg(LM_ADDR, LM_REG_PD_STATUS0, &pd0, 1)) g_pd_status = pd0;
+        else                                                          i2c1_master_recover();
+        uint8_t cc = (pd0 & LM_CC_OPERATION) ? 1U : 0U;
+
+        static uint32_t oc_since = 0;
+        if (!(batt & PR_BATT_VALID)) {
+            g_oc_fault = 0; g_oc_active = 0;         /* pack removed -> re-arm */
+        } else if (cc) {
             if (!g_oc_active) { g_oc_active = 1; oc_since = DWT->CYCCNT; }
             else if ((DWT->CYCCNT - oc_since) / (SystemCoreClock / 1000U) >= OC_DEBOUNCE_MS) {
-                g_oc_fault = 1;          /* sustained over-current -> soft fail */
+                g_oc_fault = 1;                       /* sustained CC -> soft fail */
             }
         } else {
-            g_oc_active = 0;             /* dropped below the limit -> reset */
+            g_oc_active = 0;                          /* dropped below limit -> reset */
         }
 
-        /* 5. Final FET state: sag-permitted AND not over-current. */
-        uint8_t fet_on = (uint8_t)(base_fet && !g_oc_fault);
+        /* 5b. On the transition to no-pack, clear the sim's latched faults. */
+        static uint8_t was_valid = 0;
+        if (!(batt & PR_BATT_VALID) && was_valid) {
+            uint8_t cf[2] = { LM_REG_CLEAR_FAULTS, 0x00u };   /* access clears */
+            i2c1_master_write(LM_ADDR, cf, 2);
+        }
+        was_valid = (batt & PR_BATT_VALID) ? 1U : 0U;
+
+        /* 6. Drive the physical Power FET: enabled AND not over-current. */
+        uint8_t fet_on = (uint8_t)(enable && !g_oc_fault);
         pwrfet_set(fet_on);
         g_fet_on = fet_on;
-        if (fet_on)     flags |= PR_FLAG_FET_ON;
-        if (g_oc_fault) flags |= PR_FLAG_OC;
-
-        /* 6. Push the telemetry frame to the sim over I2C1. u16 caps at
-         *    65.535 V, far above any pack we sense. */
-        uint16_t vin16 = (src_mv > 65535U) ? 65535U : (uint16_t)src_mv;
-        uint8_t  frame[PR_FRAME_LEN];
-        pr_build_telemetry(frame, vin16, cells, flags);
-        g_link_ok = (uint8_t)i2c1_master_write(PR_I2C_ADDR, frame, PR_FRAME_LEN);
-        if (!g_link_ok) {
-            /* Slave not answering yet (still booting) or bus wedged: reset the
-             * peripheral so the next attempt is clean and we self-heal without
-             * a manual translator reset. */
-            i2c1_master_recover();
-        }
 
         led_toggle();                /* heartbeat = alive + sampling */
         delay_ms(100);

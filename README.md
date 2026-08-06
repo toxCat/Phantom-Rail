@@ -11,28 +11,35 @@ share the CMSIS/HAL tree under `Drivers/`.
 
 | Directory        | Board            | I2C1 role | Responsibilities |
 |------------------|------------------|-----------|------------------|
-| `translator/`    | Black Pill #1    | **master** | FC UART (USART1/MSP), source-sense ADC (PA0), drives the sim board on I2C1 (PB6/PB7), enable/disable + UVLO |
-| `lm51772-sim/`   | Black Pill #2    | **slave**  | Emulates the LM51772 register interface, renders the 16x2 LCD over hardware I2C2 (PB10/PB3) |
+| `translator/`    | Black Pill #1    | **host / master** | Source-sense ADC (PA0), pack detection + sag monitor, Power FET (PA1), drives the sim's LM51772 registers over I2C1 (PB6/PB7); FC UART next |
+| `lm51772-sim/`   | Black Pill #2    | **LM51772 / slave** | Presents the real LM51772 register interface (addr 0x6A), current sense (ACS709 on PA0), 16x2 LCD over hardware I2C2 (PB10/PB3) |
 
-The **translator is the master**: it reads the source voltage, detects the
-pack, and pushes a telemetry frame to the **sim (slave)** over **I2C1 on
-PB6/PB7**. The sim board owns the LCD presentation on its own bus (I2C2), so
-the two I2C buses never collide.
+The **translator is the host/master**: it acts like a flight controller driving
+a real LM51772 — writing the sim's control registers (output voltage, current
+limit, enable) and reading status. The sim board owns the LCD on its own bus
+(I2C2), so the two I2C buses never collide.
 
 ```
-  FC ── USART1 ──▶ translator (BP#1, master) ── I2C1 (PB6/PB7) ──▶ lm51772-sim (BP#2, slave) ── I2C2 ──▶ 1602 LCD
-                        │
-                     ADC1_IN0 (PA0, /9 divider) = source voltage
+  FC ── USART1 ──▶ translator (BP#1, host) ── I2C1 (PB6/PB7) ──▶ lm51772-sim (BP#2, LM51772 @0x6A) ── I2C2 ──▶ 1602 LCD
+                        │                                              │
+                   PA0 = battery (VIN), PA1 = Power FET          PA0 = ACS709 output current (Iout)
 ```
 
-## Inter-board link
+## Inter-board link (LM51772 register interface)
 
-The I2C1 wire format lives in `Protocol/phantom_link.h`, `#include`d by both
-projects so master and slave can't drift. Each control cycle the master
-**writes** a 6-byte telemetry frame (`CMD, VIN_lo, VIN_hi, cells, flags, xor`)
-to slave `0x42`, then **reads** back a 4-byte current frame (`I_lo, I_hi,
-cflags, xor`) — the sim's ACS709 reading, which the translator uses for the 2 A
-cutoff. The slave services both directions under interrupt (clock-stretch-safe).
+The sim mimics the TI **LM51772** buck-boost controller's I2C register map
+(datasheet SNVSC22D); `Protocol/lm51772_regs.h` is the shared definition
+(`#include`d by both projects). Standard register-addressed I2C at slave
+address **0x6A** — a write is `S ADDR+W REG D0 [D1 …] P` (auto-increment); a
+read is `S ADDR+W REG Sr ADDR+R D0 … nA P`. The slave services both under
+interrupt (clock-stretch-safe).
+
+Key registers the host drives: **VOUT_TARGET** (0x0C/0x0D, 12-bit ×20 mV →
+commanded output), **ILIM_THRESHOLD** (0x0A → current limit), **CONV_EN2**
+(0x81 bit0 → enable), read-back **STATUS_BYTE** (0x78) / **CC_OPERATION**
+(0x21). The battery/sag view (no VIN telemetry exists in the real IC) is passed
+to the sim's display via clearly-marked Phantom-Rail **extension registers**
+(0xE0–0xE3).
 
 **Wiring (do this before expecting anything on screen):**
 - `BP#1 PB6 (SCL) ── BP#2 PB6 (SCL)` and `BP#1 PB7 (SDA) ── BP#2 PB7 (SDA)`
@@ -42,18 +49,18 @@ cutoff. The slave services both directions under interrupt (clock-stretch-safe).
 
 ## Status
 
-- `translator/` — **detects the pack, drives the link, gates the Power FET.**
-  Register-level ADC1_IN0 reader (PA0, /9 → `g_source_mv`), cell-count
-  detection latched at plug-in, a 3-band sag monitor driving an N-channel
-  **Power FET on PA1** (charged → on, `LOW` → on, `<3.2 V/cell` → off), a
-  register-level I2C1 **master** that pushes each reading and **reads back** the
-  sim's current, and a **2 A over-current soft-fail** that latches the FET off.
-  Self-heals on a start-up NACK. PC13 heartbeat. TODO: USART1/MSP, selectors.
-- `lm51772-sim/` — **displays source + current, sends current back over I2C1.**
-  Interrupt-driven I2C1 **slave** feeds the LCD's `IN:nS XX.XXV` row with the
-  sag warning (`LOW` / `(x_X)`), and on a master read returns its **ACS709
-  current** (PA0) — also shown on row1 as `OUT:12.00V X.XXA`. Register-level
-  hardware-I2C2 LCD driver (PCF8574 + HD44780, auto-detect); PC13 heartbeat.
+- `translator/` — **host controller.** Register-level ADC1_IN0 reader (PA0,
+  /9 → `g_source_mv`), cell-count detection latched at plug-in, 3-band sag
+  monitor, N-channel **Power FET on PA1**. Each cycle it writes the sim's
+  LM51772 registers (VOUT_TARGET = 12 V default, ILIM = 2 A, CONV_EN2) and reads
+  back CC_OPERATION; a **debounced over-current** (CC held ≥1 s) latches the FET
+  off. Self-heals on a start-up NACK. PC13 heartbeat. TODO: USART1/MSP, selectors.
+- `lm51772-sim/` — **LM51772 register model.** Interrupt-driven register-addressed
+  I2C1 slave @ 0x6A with the datasheet register file. Row0 shows the battery IN
+  (from extension registers) with the sag warning (`LOW`/`(x_X)`); row1 shows the
+  LM51772 output view `12.00V 1.85A ON` (commanded VOUT, measured ACS709 current,
+  status ON/CC/OC/OFF). Register-level hardware-I2C2 LCD driver (PCF8574 +
+  HD44780, auto-detect); PC13 heartbeat.
 
 ## Build & flash
 

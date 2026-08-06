@@ -1,9 +1,9 @@
-# LM51772 Sim — Black Pill #2 (I2C1 slave)
+# LM51772 Sim — Black Pill #2 (LM51772 model / I2C1 slave)
 
-Emulates the LM51772 register interface for the translator (`../translator`)
-and presents status on a 16x2 LCD. It is the **I2C1 slave**; the translator is
-the master. The LCD lives on a **separate** hardware bus (I2C2) so the two
-buses never collide.
+Presents the real **LM51772** I2C register interface (datasheet SNVSC22D) to
+the translator (`../translator`) and shows state on a 16x2 LCD. It is the
+**I2C1 slave at address 0x6A**; the translator is the host/master. The LCD
+lives on a **separate** hardware bus (I2C2) so the two buses never collide.
 
 Register-level CMSIS (HAL generated but unused). Builds independently:
 `make` → `build/PhantomRail.{elf,hex,bin}`.
@@ -12,8 +12,8 @@ Register-level CMSIS (HAL generated but unused). Builds independently:
 
 | Signal           | Pin           | Function |
 |------------------|---------------|----------|
-| Translator link  | PB6 / PB7     | **I2C1 slave** (addr 0x42) — receives source telemetry, returns current on a read |
-| Current sense    | PA0           | ADC1_IN0 ← ACS709 VIOUT (simulated LM51772 internal sensor) |
+| Host link        | PB6 / PB7     | **I2C1 slave** — LM51772 register file @ 0x6A |
+| Current sense    | PA0           | ADC1_IN0 ← ACS709 VIOUT = the IC's internal Iout |
 | LCD              | PB10 / PB3    | **I2C2 master** → PCF8574 1602 backpack (SCL=PB10 AF4, SDA=PB3 AF9) |
 | Status LED       | PC13          | on-board LED (active low) |
 
@@ -23,25 +23,23 @@ Register-level CMSIS (HAL generated but unused). Builds independently:
   PCF8574 + HD44780 4-bit, standard-mode 100 kHz, DWT µs delays, per-transfer
   timeouts + NACK detection. `lcd_init()` **auto-detects** the backpack
   address (0x27 or 0x3F) and returns it (0 = bus silent).
-- **I2C1 slave** (`Src/i2c1_slave.c`) — interrupt-driven (clock-stretch-safe,
-  so the blocking LCD writes never drop bytes), address `0x42`. On a master
-  **write** it validates the telemetry frame (XOR) and feeds the `IN:` row; on
-  a master **read** it transmits the current frame (`pr_build_current`). Shows
-  `IN:--S --.--V` until a valid frame arrives or if the link goes stale (>1.5 s).
+- **LM51772 register slave** (`Src/i2c1_slave.c`) — interrupt-driven,
+  clock-stretch-safe, register-addressed with auto-increment (write sets the
+  pointer then streams data; read returns from the pointer). Holds the datasheet
+  register file (`../Protocol/lm51772_regs.h`): reset values, VOUT_TARGET, ILIM,
+  CONV_EN2, computed STATUS_BYTE / CC_OPERATION, CLEAR_FAULTS, and the
+  Phantom-Rail battery extension registers (0xE0–0xE3).
 - **Current sense** (`acs_read_ma` in `main.c`) — register-level ADC on PA0
-  reads the ACS709 VIOUT, converts to mA (tunable `ACS_ZERO_MV` /
-  `ACS_SENS_MV_PER_A`), publishes it to the slave for the translator to read,
-  and shows it on row1 as `…V X.XXA`. Exposed via `g_cur_ma` for SWD. Each
-  conversion does a clean start (clears `ADC_SR` so a stale `EOC` can't be read
-  as 0); samples are oversampled (`ACS_OVERSAMPLE`) and taken at 2 Hz
-  (`CUR_SAMPLE_MS`) with last-good hold, so the reading is steady.
-- **Display** — row0 (IN) shows the received source plus the translator's sag
-  warning: `IN:6S 22.75V` charged, `…V LOW` in the 3.2-3.6 V/cell band, or
-  `…(x_X)` below 3.2 V/cell. Row1 (OUT) shows the stubbed setpoint plus the live
-  current, e.g. `OUT:12.00V 1.85A`. A `LINK_DEBUG` toggle in `main.c` swaps row1
-  for I2C1 link counters during bring-up.
-- **PC13 heartbeat** — 3 flashes at boot (proof of running from flash), then
-  ~2 Hz when live source frames are arriving / ~3 Hz when the link is idle.
+  reads the ACS709 VIOUT → mA (tunable `ACS_ZERO_MV` / `ACS_SENS_MV_PER_A`);
+  this is the IC's Iout, compared to the programmed ILIM to raise CC/OC. Each
+  conversion clean-starts (`ADC_SR = 0` so a stale `EOC` can't read as 0);
+  oversampled (`ACS_OVERSAMPLE`) at 2 Hz (`CUR_SAMPLE_MS`) with last-good hold.
+- **Display** — row0 (IN, battery from the extension registers) `IN:6S 22.75V`
+  with sag warning (`LOW` / `(x_X)`). Row1 (OUT, LM51772 view)
+  `12.00V 1.85A ON` = commanded VOUT (from VOUT_TARGET), measured current, and
+  status **ON** / **CC** (in current-limit) / **OC** (over-current latched) /
+  **OFF** (CONV_EN2 = 0).
+- **PC13 heartbeat**.
 
 The link needs external pull-ups on SDA/SCL and a common ground — see the root
 README.

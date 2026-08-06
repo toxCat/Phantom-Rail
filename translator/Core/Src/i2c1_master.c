@@ -108,30 +108,11 @@ int i2c1_master_write(uint8_t addr7, const uint8_t *data, uint32_t len)
     return 1;
 }
 
-int i2c1_master_read(uint8_t addr7, uint8_t *buf, uint32_t n)
+/* Receive n bytes after ADDR (read) has been matched but not yet cleared.
+ * Runs the STM32F4 master-receiver ACK/STOP tail so the final byte is NACKed.
+ * Returns 1 on success. See RM0383 "Master receiver" (EV6_1 / EV7 / EV7_1). */
+static int recv_after_addr(uint8_t *buf, uint32_t n)
 {
-    if (n == 0) return 0;
-
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = I2C_TIMEOUT_US * (SystemCoreClock / 1000000U);
-    while (I2C1->SR2 & I2C_SR2_BUSY) {
-        if ((DWT->CYCCNT - start) > ticks) return 0;
-    }
-
-    I2C1->CR1 |=  I2C_CR1_ACK;                    /* ACK incoming bytes    */
-    I2C1->CR1 &= ~I2C_CR1_POS;
-    I2C1->CR1 |=  I2C_CR1_START;
-    if (!wait_sr1(I2C_SR1_SB)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
-
-    I2C1->DR = (uint8_t)((addr7 << 1) | 1U);      /* address + read        */
-    if (!wait_sr1(I2C_SR1_ADDR)) {
-        I2C1->SR1 &= ~I2C_SR1_AF;
-        I2C1->CR1 |= I2C_CR1_STOP;
-        return 0;
-    }
-
-    /* The last byte must be NACKed, so the tail differs by count. See RM0383
-     * "Master receiver" (EV6_1 / EV7 / EV7_1). */
     if (n == 1U) {
         I2C1->CR1 &= ~I2C_CR1_ACK;                /* NACK the only byte    */
         (void)I2C1->SR1; (void)I2C1->SR2;         /* clear ADDR            */
@@ -153,7 +134,6 @@ int i2c1_master_read(uint8_t addr7, uint8_t *buf, uint32_t n)
             if (!wait_sr1(I2C_SR1_RXNE)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
             buf[i++] = (uint8_t)I2C1->DR;
         }
-        /* 3 bytes left: BTF => DataN-2 in DR, DataN-1 in shift register */
         if (!wait_sr1(I2C_SR1_BTF)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
         I2C1->CR1 &= ~I2C_CR1_ACK;                /* NACK DataN            */
         buf[i++] = (uint8_t)I2C1->DR;             /* DataN-2               */
@@ -162,8 +142,65 @@ int i2c1_master_read(uint8_t addr7, uint8_t *buf, uint32_t n)
         if (!wait_sr1(I2C_SR1_RXNE)) return 0;
         buf[i++] = (uint8_t)I2C1->DR;             /* DataN                 */
     }
-
     I2C1->CR1 |=  I2C_CR1_ACK;                    /* restore defaults      */
     I2C1->CR1 &= ~I2C_CR1_POS;
     return 1;
+}
+
+int i2c1_master_read(uint8_t addr7, uint8_t *buf, uint32_t n)
+{
+    if (n == 0) return 0;
+
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = I2C_TIMEOUT_US * (SystemCoreClock / 1000000U);
+    while (I2C1->SR2 & I2C_SR2_BUSY) {
+        if ((DWT->CYCCNT - start) > ticks) return 0;
+    }
+
+    I2C1->CR1 |=  I2C_CR1_ACK;
+    I2C1->CR1 &= ~I2C_CR1_POS;
+    I2C1->CR1 |=  I2C_CR1_START;
+    if (!wait_sr1(I2C_SR1_SB)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
+
+    I2C1->DR = (uint8_t)((addr7 << 1) | 1U);      /* address + read        */
+    if (!wait_sr1(I2C_SR1_ADDR)) {
+        I2C1->SR1 &= ~I2C_SR1_AF;
+        I2C1->CR1 |= I2C_CR1_STOP;
+        return 0;
+    }
+    return recv_after_addr(buf, n);
+}
+
+int i2c1_master_read_reg(uint8_t addr7, uint8_t reg, uint8_t *buf, uint32_t n)
+{
+    if (n == 0) return 0;
+
+    uint32_t start = DWT->CYCCNT;
+    uint32_t ticks = I2C_TIMEOUT_US * (SystemCoreClock / 1000000U);
+    while (I2C1->SR2 & I2C_SR2_BUSY) {
+        if ((DWT->CYCCNT - start) > ticks) return 0;
+    }
+
+    /* Phase 1: START, addr+W, register pointer -- no STOP. */
+    I2C1->CR1 |=  I2C_CR1_ACK;
+    I2C1->CR1 &= ~I2C_CR1_POS;
+    I2C1->CR1 |=  I2C_CR1_START;
+    if (!wait_sr1(I2C_SR1_SB)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
+    I2C1->DR = (uint8_t)(addr7 << 1);
+    if (!wait_sr1(I2C_SR1_ADDR)) {
+        I2C1->SR1 &= ~I2C_SR1_AF; I2C1->CR1 |= I2C_CR1_STOP; return 0;
+    }
+    (void)I2C1->SR1; (void)I2C1->SR2;             /* clear ADDR */
+    if (!wait_sr1(I2C_SR1_TXE)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
+    I2C1->DR = reg;
+    if (!wait_sr1(I2C_SR1_BTF)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
+
+    /* Phase 2: repeated START, addr+R, receive n. */
+    I2C1->CR1 |= I2C_CR1_START;
+    if (!wait_sr1(I2C_SR1_SB)) { I2C1->CR1 |= I2C_CR1_STOP; return 0; }
+    I2C1->DR = (uint8_t)((addr7 << 1) | 1U);
+    if (!wait_sr1(I2C_SR1_ADDR)) {
+        I2C1->SR1 &= ~I2C_SR1_AF; I2C1->CR1 |= I2C_CR1_STOP; return 0;
+    }
+    return recv_after_addr(buf, n);
 }
