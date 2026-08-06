@@ -31,6 +31,8 @@ BUILD_DIR = build
 C_SOURCES =  \
 Core/Src/main.c \
 Core/Src/i2c1_master.c \
+Core/Src/usart1.c \
+Core/Src/msp.c \
 Core/Src/system_stm32f4xx.c \
 Core/Src/sysmem.c \
 Core/Src/syscalls.c

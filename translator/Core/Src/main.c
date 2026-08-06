@@ -1,6 +1,8 @@
 #include "stm32f4xx.h"    /* CMSIS device header; SystemInit() runs from startup */
 #include "i2c1_master.h"  /* register-addressed I2C1 master (PB6/PB7) */
 #include "lm51772_regs.h" /* shared LM51772 register map (../Protocol) */
+#include "usart1.h"       /* USART1 (PA9/PA10) to the FC */
+#include "msp.h"          /* MSP client: read RC channels from Betaflight */
 
 /*
  * Phantom-Rail -- Translator (Black Pill #1): the I2C1 MASTER / host controller.
@@ -61,9 +63,20 @@
 #define CUR_LIMIT_MA  2000U /* 2.0 A soft limit (5 A in the product)      */
 #define OC_DEBOUNCE_MS 1000U /* CC must persist this long to cut          */
 
-/* Commanded LM51772 output voltage (host -> VOUT_TARGET). Fixed for now; the FC
- * and transmitter script will drive this in the next tasks. */
-#define VOUT_CMD_MV   12000U
+/* ---- FC link (Task 2): MSP master on USART1 ----
+ * The transmitter's GVAR/pot/switch values reach Betaflight as RC channels; we
+ * read them with MSP_RC and map them to the LM51772 controls. The operator's
+ * pot rides on one AUX channel (voltage) and a switch on another (enable).
+ * Betaflight MSP_RC order is AETR then AUX1.. -> AUX1 = index 4, AUX2 = 5. */
+#define MSP_BAUD           115200U
+#define MSP_CH_COUNT       8U      /* channels to fetch                    */
+#define MSP_CH_VOLTAGE     4U      /* AUX1: output-voltage pot             */
+#define MSP_CH_FET         5U      /* AUX2: Power-FET enable switch        */
+#define FET_ON_US          1500U   /* AUX >= this us -> enable             */
+#define FC_LINK_TIMEOUT_MS 500U    /* no fresh MSP this long -> fail-safe  */
+#define VOUT_MIN_MV        3300U   /* pot 1000 us -> 3.3 V (IC lower clamp) */
+#define VOUT_MAX_MV        24000U  /* pot 2000 us -> 24 V                  */
+#define VOUT_DEFAULT_MV    12000U  /* held until the FC first commands     */
 
 /* Latest values, exposed (volatile, non-static) so they survive -Og and can
  * be watched over SWD. */
@@ -77,6 +90,9 @@ volatile uint8_t  g_fet_on    = 0;   /* Power FET state driven on PA1 */
 volatile uint8_t  g_oc_fault  = 0;   /* 1 = over-current cutoff latched */
 volatile uint8_t  g_oc_active = 0;   /* 1 = CC asserted, debounce running */
 volatile uint8_t  g_pd_status = 0;   /* last USB_PD_STATUS_0 read from sim */
+volatile uint16_t g_vout_cmd_mv = VOUT_DEFAULT_MV; /* commanded VOUT (FC pot) */
+volatile uint8_t  g_fc_enable = 0;   /* FC-commanded enable (aux switch) */
+volatile uint8_t  g_fc_link   = 0;   /* 1 = fresh MSP data from the FC */
 
 /* -------- microsecond delays via the DWT cycle counter -------- */
 static void dwt_init(void)
@@ -162,6 +178,7 @@ int main(void)
     adc_init();
     pwrfet_init();                   /* Power FET gate on PA1, starts OFF */
     i2c1_master_init();              /* link to the LM51772 sim (PB6/PB7) */
+    usart1_init(MSP_BAUD);           /* MSP link to the FC (PA9/PA10) */
 
     for (;;) {
         /* 1. Read the source voltage behind the /9 divider. */
@@ -180,21 +197,43 @@ int main(void)
         }
         uint8_t cells = g_cells;
 
-        /* 3. Sag monitor -> enable command + battery flags. Enable the converter
-         *    through the LOW band; disable it below the critical floor. */
+        /* 3. Sag flags + battery-ok veto. The battery no longer commands the
+         *    enable (the FC does) -- it only VETOes: a critical pack disables
+         *    the output regardless of what the transmitter asks. */
         uint16_t per_cell = (cells > 0) ? (uint16_t)(src_mv / cells) : 0U;
         g_cell_mv = per_cell;
 
-        uint8_t enable = 0;
+        uint8_t batt_ok = 0;
         if (batt & PR_BATT_VALID) {
-            if (per_cell < CELL_CRIT_MV)      batt |= PR_BATT_CRIT;      /* disable */
-            else if (per_cell < CELL_LOW_MV) { batt |= PR_BATT_LOW; enable = 1; }
-            else if (per_cell <= CELL_HI_MV)   enable = 1;
+            if (per_cell < CELL_CRIT_MV)      batt |= PR_BATT_CRIT;      /* veto */
+            else if (per_cell < CELL_LOW_MV) { batt |= PR_BATT_LOW; batt_ok = 1; }
+            else if (per_cell <= CELL_HI_MV)   batt_ok = 1;
         }
+
+        /* 3b. Poll the FC (MSP_RC) for the transmitter's pot/switch commands. */
+        uint16_t ch[MSP_CH_COUNT];
+        int nch = msp_read_rc(ch, MSP_CH_COUNT);
+        static uint32_t fc_stamp = 0;
+        if (nch > (int)MSP_CH_FET) {
+            g_fc_link = 1; fc_stamp = DWT->CYCCNT;
+            uint16_t us = ch[MSP_CH_VOLTAGE];
+            if (us < 1000U) us = 1000U;
+            if (us > 2000U) us = 2000U;
+            g_vout_cmd_mv = (uint16_t)(VOUT_MIN_MV +
+                (uint32_t)(us - 1000U) * (VOUT_MAX_MV - VOUT_MIN_MV) / 1000U);
+            g_fc_enable = (ch[MSP_CH_FET] >= FET_ON_US) ? 1U : 0U;
+        } else if (g_fc_link &&
+                   (DWT->CYCCNT - fc_stamp) / (SystemCoreClock / 1000U) >= FC_LINK_TIMEOUT_MS) {
+            g_fc_link = 0;                        /* link lost -> fail-safe */
+        }
+        uint8_t fc_enable = g_fc_link ? g_fc_enable : 0U;
+
+        /* Final enable: the FC commands it, the battery can veto it. */
+        uint8_t enable = (uint8_t)(fc_enable && batt_ok);
 
         /* 4. Drive the LM51772 registers on the sim (host writes). */
         uint16_t vin16 = (src_mv > 65535U) ? 65535U : (uint16_t)src_mv;
-        uint16_t vcode = lm_vout_from_mv(VOUT_CMD_MV, 1);  /* div20=1 (reset) */
+        uint16_t vcode = lm_vout_from_mv(g_vout_cmd_mv, 1);  /* div20=1 (reset) */
         int ok = 1;
         /* 4a. Battery view for the sim's display (extension registers). */
         uint8_t ext[5] = { PR_EXT_VIN_LSB, (uint8_t)vin16, (uint8_t)(vin16 >> 8),

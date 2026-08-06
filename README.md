@@ -49,12 +49,14 @@ to the sim's display via clearly-marked Phantom-Rail **extension registers**
 
 ## Status
 
-- `translator/` — **host controller.** Register-level ADC1_IN0 reader (PA0,
-  /9 → `g_source_mv`), cell-count detection latched at plug-in, 3-band sag
-  monitor, N-channel **Power FET on PA1**. Each cycle it writes the sim's
-  LM51772 registers (VOUT_TARGET = 12 V default, ILIM = 2 A, CONV_EN2) and reads
-  back CC_OPERATION; a **debounced over-current** (CC held ≥1 s) latches the FET
-  off. Self-heals on a start-up NACK. PC13 heartbeat. TODO: USART1/MSP, selectors.
+- `translator/` — **host controller + FC bridge.** Register-level ADC1_IN0
+  reader (PA0, /9), cell-count detection latched at plug-in, N-channel **Power
+  FET on PA1**. Polls Betaflight over **MSP** (USART1, PA9/PA10 @ 115200) for the
+  transmitter's pot/switch (AUX1 → voltage, AUX2 → enable), then writes the sim's
+  LM51772 registers (VOUT_TARGET from the pot, ILIM = 2 A, CONV_EN2 from the
+  switch) and reads back CC_OPERATION; a **debounced over-current** (CC held
+  ≥1 s) latches the FET off, and a **critical battery vetoes** the enable. PC13
+  heartbeat. TODO: transmitter Lua script (Task 3).
 - `lm51772-sim/` — **LM51772 register model.** Interrupt-driven register-addressed
   I2C1 slave @ 0x6A with the datasheet register file. Row0 shows the battery IN
   (from extension registers) with the sag warning (`LOW`/`(x_X)`); row1 shows the
