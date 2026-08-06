@@ -53,8 +53,8 @@
  * from the datasheet (or a known load). Power the sensor so VIOUT stays <=3V3. */
 #define ACS_VREF_MV        3300U
 #define ACS_ADC_MAX        4095U
-#define ACS_ZERO_MV        2500U   /* VIOUT at 0 A (nominal -35BB @ 5V) */
-#define ACS_SENS_MV_PER_A  28U     /* sensitivity, mV per amp          */
+#define ACS_ZERO_MV        2494U   /* measured VIOUT at 0 A on this rig (~VCC/2) */
+#define ACS_SENS_MV_PER_A  28U     /* -35BB @ ~5V; 1 ADC count ~= 29 mA of I */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
