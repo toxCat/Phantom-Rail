@@ -61,8 +61,12 @@ to the sim's display via clearly-marked Phantom-Rail **extension registers**
   I2C1 slave @ 0x6A with the datasheet register file. Row0 shows the battery IN
   (from extension registers) with the sag warning (`LOW`/`(x_X)`); row1 shows the
   LM51772 output view `12.00V 1.85A ON` (commanded VOUT, measured ACS709 current,
-  status ON/CC/OC/OFF). Register-level hardware-I2C2 LCD driver (PCF8574 +
-  HD44780, auto-detect); PC13 heartbeat.
+  status ON/CC/OC/OFF — CC while at the current limit, OC once the over-current
+  is sustained). Register-level hardware-I2C2 LCD driver; PC13 heartbeat.
+- `transmitter/` — **EdgeTX Lua** (`SCRIPTS/MIXES/` + `SCRIPTS/TOOLS/`) so the
+  operator sets the output voltage (pot or a fixed value in 20 mV datasheet
+  steps) and toggles the FET from an aux switch; the values ride the RC link to
+  Betaflight and reach the translator over MSP. See `transmitter/README.md`.
 
 ## Build & flash
 

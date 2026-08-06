@@ -51,6 +51,7 @@
 #define ACS_SENS_MV_PER_A  28U     /* -35BB @ ~5V; 1 ADC count ~= 29 mA of I */
 #define ACS_OVERSAMPLE     8U      /* conversions averaged per sample (noise)  */
 #define CUR_SAMPLE_MS      500U    /* re-sample the current at 2 Hz, hold between */
+#define OC_DEBOUNCE_MS     1000U   /* CC sustained this long -> latch IOUT_OC   */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -343,13 +344,24 @@ int main(void)
     uint16_t vout_mv = lm_vout_to_mv(vcode, div20);
     uint16_t ilim_ma = lm_ilim_to_ma(lm_reg_get(LM_REG_ILIM));
 
-    /* 3. Model status. CC when enabled and the measured current is at/above the
-     *    programmed ILIM; IOUT_OC latches until CLEAR_FAULTS. VIN_UV mirrors the
-     *    host's battery-critical flag (extension register). */
-    static uint8_t oc_latched = 0;
-    if (lm_take_clear_faults()) oc_latched = 0;
+    /* 3. Model status. CC_OPERATION is the instantaneous current-limit state
+     *    (enabled and measured current at/above ILIM) -- a normal regulating
+     *    state. Only when CC persists for OC_DEBOUNCE_MS does the IOUT_OC fault
+     *    latch (soft-fail), until CLEAR_FAULTS. VIN_UV mirrors the host's
+     *    battery-critical flag (extension register). */
+    static uint8_t  oc_latched = 0;
+    static uint8_t  cc_active  = 0;
+    static uint32_t cc_since   = 0;
+    if (lm_take_clear_faults()) { oc_latched = 0; cc_active = 0; }
     uint8_t cc = (enable && cur_ma >= ilim_ma) ? 1U : 0U;
-    if (cc) oc_latched = 1;
+    if (cc) {
+        if (!cc_active) { cc_active = 1; cc_since = DWT->CYCCNT; }
+        else if ((DWT->CYCCNT - cc_since) / (SystemCoreClock / 1000U) >= OC_DEBOUNCE_MS) {
+            oc_latched = 1;
+        }
+    } else {
+        cc_active = 0;
+    }
 
     uint8_t batt = lm_reg_get(PR_EXT_BATT);
     uint8_t status = 0;

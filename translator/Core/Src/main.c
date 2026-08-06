@@ -53,15 +53,15 @@
 #define CELL_HI_MV   4200U /* 3.6-4.2: charged; above: over-voltage guard   */
 
 /* ---- Over-current soft-fail (via the LM51772 model) ----
- * The host writes ILIM_THRESHOLD (CUR_LIMIT_MA) to the sim; the sim compares
- * its ACS709 reading to that limit and raises CC_OPERATION / IOUT_OC. The host
- * reads CC_OPERATION back and cuts the FET only when it stays set continuously
- * for OC_DEBOUNCE_MS (a motor-ramp transient must not nuisance-trip; the LM51772
- * handles fast limiting itself -- this FET is the sustained-fault backstop). The
- * latch holds until the pack is removed (re-arm), which also clears the sim's
- * faults. The translator never senses current directly. */
+ * The host writes ILIM_THRESHOLD (CUR_LIMIT_MA) to the sim; the sim compares its
+ * ACS709 reading to that limit, raises CC_OPERATION instantly, and latches the
+ * IOUT_OC fault after the over-current is sustained (the 1 s debounce lives on
+ * the sim -- it owns current + ILIM; a motor-ramp transient must not
+ * nuisance-trip, and the LM51772 does fast limiting itself). The host reads
+ * STATUS_BYTE, and on IOUT_OC cuts the FET (the sustained-fault backstop). The
+ * latch holds until the pack is removed (re-arm), which also issues CLEAR_FAULTS.
+ * The translator never senses current directly. */
 #define CUR_LIMIT_MA  2000U /* 2.0 A soft limit (5 A in the product)      */
-#define OC_DEBOUNCE_MS 1000U /* CC must persist this long to cut          */
 
 /* ---- FC link (Task 2): MSP master on USART1 ----
  * The transmitter's GVAR/pot/switch values reach Betaflight as RC channels; we
@@ -87,9 +87,8 @@ volatile uint16_t g_adc_raw   = 0;   /* last raw ADC count (0..4095) */
 volatile uint8_t  g_adc_ok    = 0;   /* 1 = last conversion completed */
 volatile uint16_t g_cell_mv   = 0;   /* per-cell voltage, millivolts */
 volatile uint8_t  g_fet_on    = 0;   /* Power FET state driven on PA1 */
-volatile uint8_t  g_oc_fault  = 0;   /* 1 = over-current cutoff latched */
-volatile uint8_t  g_oc_active = 0;   /* 1 = CC asserted, debounce running */
-volatile uint8_t  g_pd_status = 0;   /* last USB_PD_STATUS_0 read from sim */
+volatile uint8_t  g_oc_fault    = 0; /* 1 = over-current cutoff latched (FET off) */
+volatile uint8_t  g_status_byte = 0; /* last STATUS_BYTE read from the sim */
 volatile uint16_t g_vout_cmd_mv = VOUT_DEFAULT_MV; /* commanded VOUT (FC pot) */
 volatile uint8_t  g_fc_enable = 0;   /* FC-commanded enable (aux switch) */
 volatile uint8_t  g_fc_link   = 0;   /* 1 = fresh MSP data from the FC */
@@ -252,23 +251,14 @@ int main(void)
         g_link_ok = (uint8_t)ok;
         if (!ok) i2c1_master_recover();   /* self-heal a stuck/booting link */
 
-        /* 5. Read CC_OPERATION back and debounce the over-current cutoff. */
-        uint8_t pd0 = 0;
-        if (i2c1_master_read_reg(LM_ADDR, LM_REG_PD_STATUS0, &pd0, 1)) g_pd_status = pd0;
+        /* 5. Read STATUS_BYTE; the sim latches IOUT_OC after sustained CC. */
+        uint8_t st = 0;
+        if (i2c1_master_read_reg(LM_ADDR, LM_REG_STATUS_BYTE, &st, 1)) g_status_byte = st;
         else                                                          i2c1_master_recover();
-        uint8_t cc = (pd0 & LM_CC_OPERATION) ? 1U : 0U;
 
-        static uint32_t oc_since = 0;
-        if (!(batt & PR_BATT_VALID)) {
-            g_oc_fault = 0; g_oc_active = 0;         /* pack removed -> re-arm */
-        } else if (cc) {
-            if (!g_oc_active) { g_oc_active = 1; oc_since = DWT->CYCCNT; }
-            else if ((DWT->CYCCNT - oc_since) / (SystemCoreClock / 1000U) >= OC_DEBOUNCE_MS) {
-                g_oc_fault = 1;                       /* sustained CC -> soft fail */
-            }
-        } else {
-            g_oc_active = 0;                          /* dropped below limit -> reset */
-        }
+        if (!(batt & PR_BATT_VALID))     g_oc_fault = 0;  /* pack removed -> re-arm */
+        else if (st & LM_ST_IOUT_OC)     g_oc_fault = 1;  /* sim latched the fault */
+        /* else: hold the latch (also robust to a dropped status read) */
 
         /* 5b. On the transition to no-pack, clear the sim's latched faults. */
         static uint8_t was_valid = 0;
