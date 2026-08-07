@@ -1,9 +1,9 @@
 # Transmitter — EdgeTX/OpenTX control scripts
 
-Lua for the radio, so an operator can remotely set the **LM51772 output voltage**
-and toggle the **Power FET** from the sticks/pots/switches. The values ride the
-normal RC link to Betaflight, which forwards them to the translator over MSP;
-the translator writes the LM51772 registers.
+Lua for the radio so an operator can remotely set the **LM51772 output voltage**
+and toggle the **Power FET**. Values ride the RC link to Betaflight, which
+forwards them to the translator over MSP; the translator writes the LM51772
+registers.
 
 ```
 TX (pot/switch + Lua) ─RC→ Betaflight ─MSP(UART)→ translator ─I2C→ LM51772 sim
@@ -11,52 +11,72 @@ TX (pot/switch + Lua) ─RC→ Betaflight ─MSP(UART)→ translator ─I2C→ L
    voltage + FET as channels                    VOUT_TARGET + CONV_EN2
 ```
 
-Written for **EdgeTX** (Lua 5.2). Two files:
+EdgeTX (Lua 5.2). Two files:
 
 | File | Type | Role |
 |------|------|------|
-| `SCRIPTS/MIXES/prvout.lua` | mixer script | drives the **voltage channel** from the pot or a fixed setpoint, snapped to the datasheet **20 mV** register steps |
-| `SCRIPTS/TOOLS/prvout.lua` | tool script  | operator UI: shows commanded V + register code + FET state, and sets the FIXED voltage in 20 mV steps |
+| `SCRIPTS/MIXES/prvout.lua` | mixer script | drives the **voltage channel** from the pot or a fixed setpoint, snapped to 20 mV register steps |
+| `SCRIPTS/TOOLS/prvout.lua` | tool script  | operator UI (encoder/PAGE/RETURN): choose POT/FIXED and set the fixed voltage in 20 mV steps |
 
-## The channel contract (this is what fixes the min/max-only symptom)
+Two shared GVARs carry the config from the tool to the mixer (both default to
+flight-mode 0): **GV5 = mode** (0 POT / 1 FIXED), **GV6 = fixed voltage as the
+register code** (voltage ÷ 20 mV).
 
-The translator reads two MSP RC channels (`MSP_CH_VOLTAGE` / `MSP_CH_FET` in the
-translator `main.c`), defaulting to **AUX1 (voltage)** and **AUX2 (FET)** —
-MSP_RC order is Roll,Pitch,Yaw,Throttle,AUX1,AUX2,… so indices **4** and **5**.
+## Using the tool (config controls only — no extra switch)
 
-> If the voltage only jumps between the min and max (3.3 V / 24 V) with no
-> gradient, the **pot and switch are swapped**: the voltage channel is reading
-> the 2-position switch. Put the **pot/voltage source on AUX1** and the **FET
-> switch on AUX2** (or swap the two `MSP_CH_*` indices to match your layout).
+Open **Tools → prvout**. Everything is done with the standard config inputs:
 
-Voltage range is **3.3–24 V** on both sides (translator `VOUT_MIN_MV`/`VOUT_MAX_MV`
-= the script's `VMIN`/`VMAX`). The translator re-quantizes to the exact 20 mV
-register code, so whatever the channel carries lands on a real datasheet step.
+- **rotate encoder** — move between `Mode` and `Set` (or press **PAGE**)
+- **press encoder** — start/stop editing the highlighted field
+- **rotate while editing** — change it (Voltage steps by **20 mV**, one register code)
+- **RETURN** — leave edit, or exit the tool
+
+`Out` shows the live commanded voltage, `FET` the switch state. The mixer keeps
+driving the channel from your GVAR/pot even after you close the tool.
+
+Ranges: pot **3.3–24 V** (continuous), fixed setpoint **3.3–20 V** in 20 mV steps
+(capped by the GVAR's ±1024 range). The translator re-quantizes to the exact
+20 mV register code either way.
 
 ## Setup
 
-1. **Copy** the two files to the SD card under `SCRIPTS/MIXES/` and
-   `SCRIPTS/TOOLS/`. Edit the `POT` / `MODESW` / `FETSW` / `GV_FIXED` constants
-   at the top of each to match your radio (they must agree between the two).
-2. **Mixer — voltage channel (AUX1):** add a mix whose source is
-   `LUA prvout Vout`; assign its two inputs to your **pot** and a **mode switch**
-   (switch high = FIXED setpoint, low = live pot).
-3. **Mixer — FET channel (AUX2):** map your chosen **aux switch** directly to
-   that channel (no Lua needed) — high ≥ ~1700 µs enables the FET.
-4. **GVAR:** the FIXED setpoint lives in `GV_FIXED` (default GV6) as the register
-   code (voltage ÷ 20 mV). Set it from the **tool** (Tools menu → prvout) with
-   the roller/+- keys, or the radio's GVAR screen.
-5. **FC side:** enable **MSP** at **115200** on the UART wired to the translator
-   (see `../translator/README.md`).
+1. Copy the two files to the SD card under `SCRIPTS/MIXES/` and `SCRIPTS/TOOLS/`.
+   Set `POT` / `FETSW` (and `GV_MODE`/`GV_FIXED` if you change them) at the top.
+2. **Voltage channel:** add a mix whose source is `LUA prvout Vout`; assign its
+   one input to your **pot**.
+3. **FET channel:** map your chosen **aux switch** directly to a channel (no Lua)
+   — high enables the FET.
+4. **FC:** enable **MSP** at **115200** on the UART wired to the translator.
 
-## Using it
+## Troubleshooting the channel mapping (the "only min/max" symptom)
 
-- **Manual:** mode switch to POT, sweep the pot → the sim's row-1 output voltage
-  tracks 3.3–24 V in 20 mV steps.
-- **Fixed:** mode switch to FIXED, open the tool, dial the voltage in 20 mV
-  steps (shows volts + register code). The channel holds that value.
-- **FET:** flip the aux switch → the sim status goes `OFF` ↔ `ON` and the Power
-  FET follows (subject to the translator's battery/over-current safety).
+If the voltage only jumps between the extremes (3.3 / 24 V), and sits at **mid
+(~13.75 V) with the TX off**, the translator's *voltage* channel is reading a
+**2-position switch**, not the pot. (A switch idles at center → mid-scale on
+failsafe; a pot would sweep.) The pot is on a **different channel** than the
+translator reads.
 
-Note: firmware safety still applies on top of these commands — a critically low
-battery or a sustained over-current will cut the FET regardless of the switch.
+The translator reads two channels, `MSP_CH_VOLTAGE` and `MSP_CH_FET`
+(`translator/Core/Src/main.c`), defaulting to **AUX1 = index 4** and
+**AUX2 = index 5**. MSP_RC order is Roll, Pitch, Yaw, Throttle, AUX1, AUX2, … so
+**AUXn = index 3 + n**.
+
+Find the right indices, two ways:
+
+- **Betaflight Configurator → Receiver tab:** wiggle the pot and note which bar
+  moves (e.g. "AUX 3" → index 6); flip the switch and note its bar. Set
+  `MSP_CH_VOLTAGE` / `MSP_CH_FET` to those indices and reflash the translator.
+- **Over SWD:** watch the `g_fc_ch[0..7]` array (raw µs). Move the pot → the
+  index that sweeps 1000↔2000 is the voltage channel; the one that snaps
+  1000/2000 is the switch. `g_fc_nch` shows how many channels the FC returned.
+
+Make sure the pot's mix (or the Lua `Vout`) lands on the channel index you set
+for `MSP_CH_VOLTAGE`, and the switch on `MSP_CH_FET`.
+
+### No-TX behaviour
+
+With the FC connected but the **TX off**, Betaflight sends its failsafe channel
+values, so the translator sees a valid MSP link and applies them (hence the mid
+voltage). If you want TX-loss to disable the output, set the FET aux channel's
+**Betaflight failsafe** to low. (A dropped *MSP/FC* link — cable out — instead
+trips the translator's own fail-safe and disables after `FC_LINK_TIMEOUT_MS`.)

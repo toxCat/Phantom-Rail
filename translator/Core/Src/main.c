@@ -92,6 +92,9 @@ volatile uint8_t  g_status_byte = 0; /* last STATUS_BYTE read from the sim */
 volatile uint16_t g_vout_cmd_mv = VOUT_DEFAULT_MV; /* commanded VOUT (FC pot) */
 volatile uint8_t  g_fc_enable = 0;   /* FC-commanded enable (aux switch) */
 volatile uint8_t  g_fc_link   = 0;   /* 1 = fresh MSP data from the FC */
+volatile uint16_t g_fc_ch[MSP_CH_COUNT] = {0}; /* raw MSP RC channels (us), for SWD:
+   watch these, wiggle the pot to see which index moves, set MSP_CH_VOLTAGE. */
+volatile int8_t   g_fc_nch = 0;      /* channels returned by the last MSP read */
 
 /* -------- microsecond delays via the DWT cycle counter -------- */
 static void dwt_init(void)
@@ -212,6 +215,9 @@ int main(void)
         /* 3b. Poll the FC (MSP_RC) for the transmitter's pot/switch commands. */
         uint16_t ch[MSP_CH_COUNT];
         int nch = msp_read_rc(ch, MSP_CH_COUNT);
+        g_fc_nch = (int8_t)nch;
+        for (uint32_t i = 0; i < MSP_CH_COUNT; i++)     /* expose for SWD */
+            g_fc_ch[i] = (nch > (int)i) ? ch[i] : 0U;
         static uint32_t fc_stamp = 0;
         if (nch > (int)MSP_CH_FET) {
             g_fc_link = 1; fc_stamp = DWT->CYCCNT;
